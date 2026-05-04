@@ -175,7 +175,6 @@ class GlobalSearchDialog(QtWidgets.QDialog):
         self.list_widget = QtWidgets.QListWidget()
         layout.addWidget(self.list_widget)
 
-        # Populate all
         for key, m in self.meta_dict.items():
             fid_hex = hex(m['frame_id'])
             display_text = f"{fid_hex} : {m['msg']} . {m['sig']}"
@@ -205,7 +204,6 @@ class GlobalSearchDialog(QtWidgets.QDialog):
             if item.checkState() == QtCore.Qt.Checked and not item.isHidden():
                 self.result_keys.append(item.data(QtCore.Qt.UserRole))
             elif item.checkState() == QtCore.Qt.Checked and item.isHidden():
-                # Keep checked items even if hidden during search
                 self.result_keys.append(item.data(QtCore.Qt.UserRole))
         super().accept()
 
@@ -213,7 +211,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BLF Viewer")
+        self.setWindowTitle("Pro BLF Signal Viewer (High Performance & Auto Y-Fit)")
         self.resize(1400, 850)
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
@@ -249,12 +247,19 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(QtWidgets.QLabel(" X-Mode: "))
         tb.addWidget(self.x_mode_combo)
         
-        self.window_spin = QtWidgets.QDoubleSpinBox(); self.window_spin.setRange(0.1, 3600.0); self.window_spin.setValue(10.0)
+        self.window_spin = QtWidgets.QDoubleSpinBox()
+        self.window_spin.setRange(0.1, 3600.0); self.window_spin.setValue(10.0)
         tb.addWidget(QtWidgets.QLabel(" Win(s): "))
         tb.addWidget(self.window_spin)
         
+        # --- 追加: Auto Y-Fit トグル ---
+        self.autoy_checkbox = QtWidgets.QCheckBox(" Auto Y-Fit ")
+        self.autoy_checkbox.setChecked(False) # 初期値はオフ（DBCスケールを優先）
+        tb.addWidget(self.autoy_checkbox)
+
         tb.addSeparator()
-        self.stale_spin = QtWidgets.QDoubleSpinBox(); self.stale_spin.setRange(0.1, 3600.0); self.stale_spin.setValue(2.0); self.stale_spin.setSingleStep(0.5)
+        self.stale_spin = QtWidgets.QDoubleSpinBox()
+        self.stale_spin.setRange(0.1, 3600.0); self.stale_spin.setValue(2.0); self.stale_spin.setSingleStep(0.5)
         tb.addWidget(QtWidgets.QLabel(" Stale(s): "))
         tb.addWidget(self.stale_spin)
 
@@ -263,7 +268,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_btn.clicked.connect(self.toggle_play)
         tb.addWidget(self.play_btn)
         
-        self.speed_spin = QtWidgets.QDoubleSpinBox(); self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setValue(1.0); self.speed_spin.setSuffix("x")
+        self.speed_spin = QtWidgets.QDoubleSpinBox()
+        self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setValue(1.0); self.speed_spin.setSuffix("x")
         tb.addWidget(QtWidgets.QLabel(" Speed: "))
         tb.addWidget(self.speed_spin)
 
@@ -356,6 +362,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         "frame_id": msg.frame_id, 
                         "msg": msg.name, 
                         "sig": s.name, 
+                        "min": sm.get("min"),
+                        "max": sm.get("max"),
                         "unit": sm.get("unit", ""), 
                         "choices": sm.get("choices")
                     }
@@ -405,7 +413,6 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
 
-        # すべての時間をマージしてユニークなタイムスタンプのリストを作成
         keys = list(self.plots.keys())
         all_times = set()
         for k in keys:
@@ -418,7 +425,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 headers = ["Time"] + [f"{hex(self.meta[k]['frame_id'])} {self.meta[k]['msg']}.{self.meta[k]['sig']}" for k in keys]
                 writer.writerow(headers)
 
-                # Step-Hold補間で全時間軸のデータを出力
                 for t in sorted_times:
                     row = [t]
                     for k in keys:
@@ -431,7 +437,7 @@ class MainWindow(QtWidgets.QMainWindow):
                             row.append("")
                     writer.writerow(row)
             self.status.showMessage(f"Exported to {path}")
-            QtWidgets.QMessageBox.information(self, "Success", f"CSV Export completed successfully.")
+            QtWidgets.QMessageBox.information(self, "Success", "CSV Export completed successfully.")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Error", str(e))
 
@@ -450,6 +456,22 @@ class MainWindow(QtWidgets.QMainWindow):
             title += f" [{meta['unit']}]"
         pi.setTitle(title, size="10pt")
         
+        # --- 追加: DBCからの初期Y軸スケール設定 ---
+        choices = meta.get("choices")
+        min_v = meta.get("min")
+        max_v = meta.get("max")
+        
+        if choices:
+            numeric_keys = []
+            for k in choices.keys():
+                try: numeric_keys.append(float(k))
+                except: pass
+            if numeric_keys:
+                pi.setYRange(min(numeric_keys) - 0.5, max(numeric_keys) + 0.5)
+        elif min_v is not None and max_v is not None and max_v > min_v:
+            span = float(max_v) - float(min_v)
+            pi.setYRange(float(min_v) - span * 0.05, float(max_v) + span * 0.05)
+
         curve = pi.plot([], [], pen=pg.mkPen(color=color, width=2))
         curve.setClipToView(True)
         curve.setDownsampling(ds=True, auto=True, method='peak')
@@ -589,6 +611,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.x_mode_combo.currentText()
         win = self.window_spin.value()
         stale_threshold = self.stale_spin.value()
+        auto_y = self.autoy_checkbox.isChecked()  # 追加: Auto Y-Fit状態の取得
         
         if mode == "Fixed Window":
             start = max(0.0, self.play_pos - win/2)
@@ -611,7 +634,6 @@ class MainWindow(QtWidgets.QMainWindow):
             p_data = self.plots[key]
             d = self.data.get(key)
             
-            # --- プロットの更新 ---
             if d and len(d["t"]) > 0:
                 t_list = d["t"]
                 
@@ -629,6 +651,17 @@ class MainWindow(QtWidgets.QMainWindow):
                     
                     t_plot = np.array(t_slice) - start
                     v_plot = np.array(v_slice)
+
+                    # --- 追加: Auto Y-Fit スケーリング処理 ---
+                    if auto_y and len(v_plot) > 0:
+                        vmin = np.min(v_plot)
+                        vmax = np.max(v_plot)
+                        if vmax > vmin:
+                            pad = (vmax - vmin) * 0.1
+                            p_data["widget"].getPlotItem().setYRange(vmin - pad, vmax + pad, padding=0)
+                        else:
+                            # 値が一定の場合は上下に0.5の余白を持たせる
+                            p_data["widget"].getPlotItem().setYRange(vmin - 0.5, vmax + 0.5, padding=0)
                     
                     t_step = np.repeat(t_plot, 2)[1:]
                     v_step = np.repeat(v_plot, 2)[:-1]
@@ -638,7 +671,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 p_data["line"].setPos(cursor_pos)
                 p_data["widget"].getPlotItem().setXRange(0, end - start, padding=0)
 
-                # --- 現在値とStaleの更新 ---
                 idx_cur = bisect.bisect_right(t_list, self.play_pos) - 1
                 if idx_cur >= 0:
                     age = self.play_pos - t_list[idx_cur]
