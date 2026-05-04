@@ -2,6 +2,8 @@ import sys
 import time
 import bisect
 import csv
+import os
+import json
 from collections import defaultdict
 
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -9,6 +11,9 @@ import pyqtgraph as pg
 import numpy as np
 import cantools
 import can
+
+# ---------------- Config File ----------------
+CONFIG_FILE = "blf_viewer_workspace.json"
 
 # ---------------- Helpers ----------------
 def _try_get_attr(obj, names, default=None):
@@ -50,19 +55,24 @@ class TimeAxisItem(pg.AxisItem):
                 out.append(f"{t:.3f}")
         return out
 
-# ---------------- BLF Reader Thread (Optimized) ----------------
+# ---------------- BLF Reader Thread (Multi-DBC Optimized) ----------------
 class BLFReaderThread(QtCore.QThread):
     data_batch_ready = QtCore.Signal(dict, float) 
     progress = QtCore.Signal(int)
     finished = QtCore.Signal()
     error = QtCore.Signal(str)
 
-    def __init__(self, blf_path, db, target_frame_ids, parent=None):
+    def __init__(self, blf_path, dbs_info, target_keys, parent=None):
         super().__init__(parent)
         self.blf_path = blf_path
-        self.db = db
-        self.target_frame_ids = set(target_frame_ids)
+        self.dbs_info = dbs_info
+        self.target_keys = set(target_keys)
         self._running = True
+
+        self.target_messages = defaultdict(list)
+        for db, dbc_name in self.dbs_info:
+            for msg in db.messages:
+                self.target_messages[msg.frame_id].append((msg, dbc_name))
 
     def stop(self):
         self._running = False
@@ -85,7 +95,9 @@ class BLFReaderThread(QtCore.QThread):
                 break
             
             arb = msg.arbitration_id
-            if arb not in self.target_frame_ids:
+            msgs_to_try = self.target_messages.get(arb)
+            
+            if not msgs_to_try:
                 continue
 
             count += 1
@@ -97,15 +109,16 @@ class BLFReaderThread(QtCore.QThread):
             if ts > max_ts:
                 max_ts = ts
             
-            try:
-                message = self.db.get_message_by_frame_id(arb)
-                decoded = message.decode(msg.data)
-                for sname, sval in decoded.items():
-                    key = f"{arb}:{message.name}:{sname}"
-                    batch[key]["t"].append(ts)
-                    batch[key]["v"].append(sval)
-            except Exception:
-                pass 
+            for message, dbc_name in msgs_to_try:
+                try:
+                    decoded = message.decode(msg.data)
+                    for sname, sval in decoded.items():
+                        key = f"{dbc_name}:{arb}:{message.name}:{sname}"
+                        if key in self.target_keys:
+                            batch[key]["t"].append(ts)
+                            batch[key]["v"].append(sval)
+                except Exception:
+                    pass 
             
             if count % 10000 == 0:
                 self.data_batch_ready.emit(dict(batch), max_ts)
@@ -122,20 +135,46 @@ class BLFReaderThread(QtCore.QThread):
             
         self.finished.emit()
 
+# ---------------- UI: Custom Widgets ----------------
+class CheckableListWidget(QtWidgets.QListWidget):
+    """
+    Shift + Click でチェックボックスの一括選択/解除ができる拡張ListWidget
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.last_clicked_row = -1
+        self.itemClicked.connect(self.on_item_clicked)
+
+    def on_item_clicked(self, item):
+        current_row = self.row(item)
+        modifiers = QtGui.QGuiApplication.keyboardModifiers()
+
+        if modifiers & QtCore.Qt.ShiftModifier and self.last_clicked_row != -1:
+            start_row = min(self.last_clicked_row, current_row)
+            end_row = max(self.last_clicked_row, current_row)
+            target_state = item.checkState()
+            
+            for r in range(start_row, end_row + 1):
+                target_item = self.item(r)
+                if not target_item.isHidden():
+                    target_item.setCheckState(target_state)
+        
+        self.last_clicked_row = current_row
+
 # ---------------- UI: Dialogs ----------------
 class SignalSelectionDialog(QtWidgets.QDialog):
-    def __init__(self, frame_id, frame_name, signals, selected_keys, parent=None):
+    def __init__(self, dbc_name, frame_id, frame_name, signals, selected_keys, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Select Signals - {frame_name} ({hex(frame_id)})")
         self.resize(350, 400)
         self.result_keys = []
 
         layout = QtWidgets.QVBoxLayout(self)
-        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget = CheckableListWidget()
         layout.addWidget(self.list_widget)
 
         for sig in signals:
-            key = f"{frame_id}:{frame_name}:{sig['name']}"
+            key = f"{dbc_name}:{frame_id}:{frame_name}:{sig['name']}"
             unit_str = f" [{sig['unit']}]" if sig['unit'] else ""
             item = QtWidgets.QListWidgetItem(f"{sig['name']}{unit_str}")
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
@@ -162,7 +201,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
     def __init__(self, meta_dict, selected_keys, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Global Search (Frame / Signal)")
-        self.resize(450, 500)
+        self.resize(500, 500)
         self.meta_dict = meta_dict
         self.result_keys = []
 
@@ -172,12 +211,13 @@ class GlobalSearchDialog(QtWidgets.QDialog):
         self.search_input.textChanged.connect(self.filter_list)
         layout.addWidget(self.search_input)
 
-        self.list_widget = QtWidgets.QListWidget()
+        self.list_widget = CheckableListWidget()
         layout.addWidget(self.list_widget)
 
         for key, m in self.meta_dict.items():
             fid_hex = hex(m['frame_id'])
-            display_text = f"{fid_hex} : {m['msg']} . {m['sig']}"
+            dbc_name = m.get('dbc_name', 'Unknown')
+            display_text = f"[{dbc_name}] {fid_hex} : {m['msg']} . {m['sig']}"
             item = QtWidgets.QListWidgetItem(display_text)
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
             if key in selected_keys:
@@ -197,6 +237,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             item.setHidden(query not in item.text().lower())
+        self.list_widget.last_clicked_row = -1
 
     def accept(self):
         for i in range(self.list_widget.count()):
@@ -211,13 +252,14 @@ class GlobalSearchDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pro BLF Signal Viewer (High Performance & Auto Y-Fit)")
+        self.setWindowTitle("BLF Viewer")
         self.resize(1400, 850)
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
         pg.setConfigOptions(antialias=False)
 
-        self.db = None
+        self.dbs_info = []
+        self.dbc_paths = []
         self.meta = {}
         self.data = defaultdict(lambda: {"t": [], "v_raw": [], "v_num": []})
         self.plots = {} 
@@ -225,8 +267,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_pos = 0.0
         self.current_display_start = 0.0
 
+        self.is_workspace_modified = False
+
         self.setup_ui()
+        self.load_config()
         self.setup_timers()
+        
+        save_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, self)
+        save_shortcut.activated.connect(self.manual_save)
 
     def setup_ui(self):
         tb = self.addToolBar("Main")
@@ -234,7 +282,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         act_blf = QtGui.QAction("📂 Open BLF", self); act_blf.triggered.connect(self.open_blf)
         tb.addAction(act_blf)
-        act_dbc = QtGui.QAction("📄 Load DBC", self); act_dbc.triggered.connect(self.open_dbc)
+        act_dbc = QtGui.QAction("➕ Add DBC(s)", self); act_dbc.triggered.connect(self.add_dbc_dialog)
         tb.addAction(act_dbc)
         tb.addSeparator()
 
@@ -244,22 +292,24 @@ class MainWindow(QtWidgets.QMainWindow):
         
         self.x_mode_combo = QtWidgets.QComboBox()
         self.x_mode_combo.addItems(["Fixed Window", "Follow (Trailing)", "Auto Fit"])
+        self.x_mode_combo.currentIndexChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" X-Mode: "))
         tb.addWidget(self.x_mode_combo)
         
         self.window_spin = QtWidgets.QDoubleSpinBox()
-        self.window_spin.setRange(0.1, 3600.0); self.window_spin.setValue(10.0)
+        self.window_spin.setRange(0.1, 3600.0)
+        self.window_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Win(s): "))
         tb.addWidget(self.window_spin)
         
-        # --- 追加: Auto Y-Fit トグル ---
         self.autoy_checkbox = QtWidgets.QCheckBox(" Auto Y-Fit ")
-        self.autoy_checkbox.setChecked(False) # 初期値はオフ（DBCスケールを優先）
+        self.autoy_checkbox.toggled.connect(self.mark_workspace_modified)
         tb.addWidget(self.autoy_checkbox)
 
         tb.addSeparator()
         self.stale_spin = QtWidgets.QDoubleSpinBox()
-        self.stale_spin.setRange(0.1, 3600.0); self.stale_spin.setValue(2.0); self.stale_spin.setSingleStep(0.5)
+        self.stale_spin.setRange(0.1, 3600.0); self.stale_spin.setSingleStep(0.5)
+        self.stale_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Stale(s): "))
         tb.addWidget(self.stale_spin)
 
@@ -269,7 +319,8 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.play_btn)
         
         self.speed_spin = QtWidgets.QDoubleSpinBox()
-        self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setValue(1.0); self.speed_spin.setSuffix("x")
+        self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setSuffix("x")
+        self.speed_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Speed: "))
         tb.addWidget(self.speed_spin)
 
@@ -285,28 +336,55 @@ class MainWindow(QtWidgets.QMainWindow):
         h_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         v_splitter_left = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
+        # === Frames List ===
         frame_group = QtWidgets.QGroupBox("1. Frames (Double-click)")
         frame_layout = QtWidgets.QVBoxLayout(frame_group)
         self.frame_tree = QtWidgets.QTreeWidget()
-        self.frame_tree.setHeaderLabels(["ID", "Message"])
+        self.frame_tree.setHeaderLabels(["DBC", "ID", "Message"])
+        
+        # UI改善: 階層ツリーの余白を消去し、完全なフラットリストとして扱う
+        self.frame_tree.setRootIsDecorated(False)
+        self.frame_tree.setUniformRowHeights(True)
+        
+        header_tree = self.frame_tree.header()
+        header_tree.setSectionResizeMode(0, QtWidgets.QHeaderView.Interactive)
+        header_tree.setSectionResizeMode(1, QtWidgets.QHeaderView.Interactive)
+        header_tree.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
+        header_tree.setStretchLastSection(True)
+        self.frame_tree.setColumnWidth(0, 100)
+        self.frame_tree.setColumnWidth(1, 60)
+        
         self.frame_tree.itemDoubleClicked.connect(self.open_signal_popup)
         frame_layout.addWidget(self.frame_tree)
         v_splitter_left.addWidget(frame_group)
 
+        # === Active Signals Table ===
         active_group = QtWidgets.QGroupBox("2. Active Signals & Values")
         active_layout = QtWidgets.QVBoxLayout(active_group)
         
-        self.active_table = QtWidgets.QTableWidget(0, 4)
-        self.active_table.setHorizontalHeaderLabels(["Vis", "Signal", "Value", ""])
-        self.active_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        self.active_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        self.active_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        self.active_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+        self.active_table = QtWidgets.QTableWidget(0, 5)
+        self.active_table.setHorizontalHeaderLabels(["👁", "Frame", "Signal", "Value", ""])
+        
+        header_tbl = self.active_table.horizontalHeader()
+        header_tbl.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+        header_tbl.setSectionResizeMode(1, QtWidgets.QHeaderView.Interactive)
+        header_tbl.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
+        header_tbl.setSectionResizeMode(3, QtWidgets.QHeaderView.Interactive)
+        header_tbl.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        
+        self.active_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.active_table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.active_table.setColumnWidth(1, 100)
+        self.active_table.setColumnWidth(2, 120)
+        self.active_table.setColumnWidth(3, 80)
         self.active_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.active_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.active_table.itemChanged.connect(self.on_active_table_item_changed)
+        
         active_layout.addWidget(self.active_table)
         v_splitter_left.addWidget(active_group)
 
+        # === Plots ===
         plot_group = QtWidgets.QGroupBox("3. Signal Plots")
         plot_layout = QtWidgets.QVBoxLayout(plot_group)
         self.plot_scroll = QtWidgets.QScrollArea()
@@ -329,10 +407,104 @@ class MainWindow(QtWidgets.QMainWindow):
 
         h_splitter.addWidget(v_splitter_left)
         h_splitter.addWidget(plot_group)
-        h_splitter.setSizes([350, 1000])
+        h_splitter.setSizes([450, 950])
         main_layout.addWidget(h_splitter)
 
         self.status = self.statusBar()
+
+    def mark_workspace_modified(self, *args):
+        self.is_workspace_modified = True
+
+    def manual_save(self):
+        self.save_config()
+        self.status.showMessage("Workspace saved successfully.", 3000)
+
+    def load_config(self):
+        default_config = {
+            "x_mode": "Fixed Window",
+            "window_span": 10.0,
+            "auto_y": False,
+            "stale_time": 2.0,
+            "speed": 1.0,
+            "dbc_paths": [],
+            "blf_path": None,
+            "selected_signals": []
+        }
+        
+        if os.path.exists(CONFIG_FILE):
+            try:
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    user_config = json.load(f)
+                    default_config.update(user_config)
+            except Exception as e:
+                print(f"Failed to load workspace: {e}")
+
+        idx = self.x_mode_combo.findText(default_config["x_mode"])
+        if idx >= 0:
+            self.x_mode_combo.setCurrentIndex(idx)
+        self.window_spin.setValue(default_config["window_span"])
+        self.autoy_checkbox.setChecked(default_config["auto_y"])
+        self.stale_spin.setValue(default_config["stale_time"])
+        self.speed_spin.setValue(default_config["speed"])
+
+        valid_dbcs = [p for p in default_config["dbc_paths"] if os.path.exists(p)]
+        if valid_dbcs:
+            self._load_dbc_files(valid_dbcs)
+            
+        blf_path = default_config["blf_path"]
+        if blf_path and os.path.exists(blf_path):
+            self.blf_path = blf_path
+            self.status.showMessage(f"Selected BLF: {self.blf_path}")
+            
+        for key in default_config["selected_signals"]:
+            if key in self.meta and key not in self.plots:
+                self.add_signal_plot(key)
+                
+        self.is_workspace_modified = False
+
+    def save_config(self):
+        config = {
+            "x_mode": self.x_mode_combo.currentText(),
+            "window_span": self.window_spin.value(),
+            "auto_y": self.autoy_checkbox.isChecked(),
+            "stale_time": self.stale_spin.value(),
+            "speed": self.speed_spin.value(),
+            "dbc_paths": self.dbc_paths,
+            "blf_path": getattr(self, 'blf_path', None),
+            "selected_signals": list(self.plots.keys())
+        }
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4)
+            self.is_workspace_modified = False
+        except Exception as e:
+            print(f"Failed to save workspace: {e}")
+
+    def closeEvent(self, event):
+        if not self.dbc_paths and not getattr(self, 'blf_path', None) and not self.plots:
+            event.accept()
+            return
+
+        if not self.is_workspace_modified:
+            event.accept()
+            return
+
+        reply = QtWidgets.QMessageBox.question(
+            self, 'Save Workspace',
+            'You have unsaved changes. Do you want to save the current workspace?\n(Settings, Loaded DBCs, BLF, and Selected Signals)',
+            QtWidgets.QMessageBox.StandardButton.Yes | 
+            QtWidgets.QMessageBox.StandardButton.No | 
+            QtWidgets.QMessageBox.StandardButton.Cancel,
+            QtWidgets.QMessageBox.StandardButton.Yes
+        )
+
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.save_config()
+            event.accept()
+        elif reply == QtWidgets.QMessageBox.StandardButton.No:
+            event.accept()
+        else:
+            event.ignore()
 
     def setup_timers(self):
         self.is_playing = False
@@ -343,51 +515,78 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui_timer.timeout.connect(self.update_plots_and_table)
         self.ui_timer.start()
 
-    def open_dbc(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open DBC", "", "DBC Files (*.dbc)")
-        if not path:
-            return
-            
-        try:
-            self.db = cantools.database.load_file(path)
-            self.frame_tree.clear()
-            self.meta.clear()
-            for msg in self.db.messages:
-                item = QtWidgets.QTreeWidgetItem(self.frame_tree, [hex(msg.frame_id), msg.name])
-                item.setData(0, QtCore.Qt.UserRole, msg.frame_id)
-                for s in msg.signals:
-                    key = f"{msg.frame_id}:{msg.name}:{s.name}"
-                    sm = get_signal_meta_from_cantools_signal(s)
-                    self.meta[key] = {
-                        "frame_id": msg.frame_id, 
-                        "msg": msg.name, 
-                        "sig": s.name, 
-                        "min": sm.get("min"),
-                        "max": sm.get("max"),
-                        "unit": sm.get("unit", ""), 
-                        "choices": sm.get("choices")
-                    }
-            self.status.showMessage(f"Loaded DBC: {path}")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "DBC Error", str(e))
+    def add_dbc_dialog(self):
+        paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self, "Add DBC(s)", "", "DBC Files (*.dbc)")
+        if paths:
+            self._load_dbc_files(paths)
+
+    def _load_dbc_files(self, paths):
+        loaded_any = False
+        for path in paths:
+            if path in self.dbc_paths:
+                continue 
+                
+            try:
+                db = cantools.database.load_file(path)
+                dbc_name = os.path.basename(path)
+                self.dbs_info.append((db, dbc_name))
+                self.dbc_paths.append(path)
+                
+                # --- UI改善: 階層ノードを廃止し、完全なフラットアイテムとして直接追加 ---
+                is_first_msg = True
+                for msg in db.messages:
+                    display_dbc = dbc_name if is_first_msg else ""
+                    is_first_msg = False
+                    
+                    item = QtWidgets.QTreeWidgetItem(self.frame_tree, [display_dbc, hex(msg.frame_id), msg.name])
+                    
+                    item.setToolTip(0, dbc_name)
+                    item.setToolTip(2, msg.name)
+                    
+                    item.setData(0, QtCore.Qt.UserRole, msg.frame_id)
+                    item.setData(1, QtCore.Qt.UserRole, dbc_name)
+                    
+                    for s in msg.signals:
+                        key = f"{dbc_name}:{msg.frame_id}:{msg.name}:{s.name}"
+                        sm = get_signal_meta_from_cantools_signal(s)
+                        self.meta[key] = {
+                            "dbc_name": dbc_name,
+                            "frame_id": msg.frame_id, 
+                            "msg": msg.name, 
+                            "sig": s.name, 
+                            "min": sm.get("min"),
+                            "max": sm.get("max"),
+                            "unit": sm.get("unit", ""), 
+                            "choices": sm.get("choices")
+                        }
+                loaded_any = True
+                self.status.showMessage(f"Loaded total {len(self.dbs_info)} DBC(s)")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "DBC Error", f"Failed to load {path}\n{str(e)}")
+                
+        if loaded_any:
+            self.mark_workspace_modified()
 
     def open_blf(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open BLF", "", "BLF Files (*.blf)")
         if path:
             self.blf_path = path
             self.status.showMessage(f"Selected BLF: {path}")
+            self.mark_workspace_modified()
 
     def open_signal_popup(self, item, column):
         frame_id = item.data(0, QtCore.Qt.UserRole)
-        if frame_id is None:
+        dbc_name = item.data(1, QtCore.Qt.UserRole)
+        msg_name = item.text(2)
+        
+        if frame_id is None or dbc_name is None:
             return
             
-        msg_name = item.text(1)
-        signals = [{"name": v["sig"], "unit": v["unit"]} for k, v in self.meta.items() if v["frame_id"] == frame_id]
+        signals = [{"name": v["sig"], "unit": v["unit"]} for k, v in self.meta.items() if v["frame_id"] == frame_id and v["dbc_name"] == dbc_name and v["msg"] == msg_name]
         if not signals:
             return
 
-        dialog = SignalSelectionDialog(frame_id, msg_name, signals, list(self.plots.keys()), self)
+        dialog = SignalSelectionDialog(dbc_name, frame_id, msg_name, signals, list(self.plots.keys()), self)
         if dialog.exec():
             for key in dialog.result_keys:
                 if key not in self.plots:
@@ -422,7 +621,7 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             with open(path, "w", newline="") as f:
                 writer = csv.writer(f)
-                headers = ["Time"] + [f"{hex(self.meta[k]['frame_id'])} {self.meta[k]['msg']}.{self.meta[k]['sig']}" for k in keys]
+                headers = ["Time"] + [f"[{self.meta[k]['dbc_name']}] {hex(self.meta[k]['frame_id'])} {self.meta[k]['msg']}.{self.meta[k]['sig']}" for k in keys]
                 writer.writerow(headers)
 
                 for t in sorted_times:
@@ -451,12 +650,11 @@ class MainWindow(QtWidgets.QMainWindow):
         pi = pw.getPlotItem()
         pi.showGrid(x=True, y=True, alpha=0.5)
         
-        title = f"{meta['msg']} . {meta['sig']}"
+        title = f"[{meta['dbc_name']}] {meta['msg']} . {meta['sig']}"
         if meta['unit']:
             title += f" [{meta['unit']}]"
         pi.setTitle(title, size="10pt")
         
-        # --- 追加: DBCからの初期Y軸スケール設定 ---
         choices = meta.get("choices")
         min_v = meta.get("min")
         max_v = meta.get("max")
@@ -486,47 +684,65 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_vbox.insertWidget(self.plot_vbox.count() - 1, pw)
         self.plots[key] = {"widget": pw, "curve": curve, "line": line, "meta": meta, "color": color}
         self.add_to_active_table(key)
+        self.mark_workspace_modified()
 
     def add_to_active_table(self, key):
         row = self.active_table.rowCount()
         self.active_table.insertRow(row)
         
-        chk = QtWidgets.QCheckBox()
-        chk.setChecked(True)
-        chk.setStyleSheet("QCheckBox::indicator { width: 16px; height: 16px; }")
-        chk.toggled.connect(lambda checked, k=key: self.plots[k]['widget'].setVisible(checked))
+        chk_item = QtWidgets.QTableWidgetItem()
+        chk_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+        chk_item.setCheckState(QtCore.Qt.Checked)
+        chk_item.setData(QtCore.Qt.UserRole, key)
+        self.active_table.setItem(row, 0, chk_item)
         
-        name_lbl = QtWidgets.QLabel(f" {self.meta[key]['sig']}")
-        name_lbl.setStyleSheet(f"color: {self.plots[key]['color'].name()}; font-weight: bold;")
+        frame_name = self.meta[key]['msg']
+        frame_item = QtWidgets.QTableWidgetItem(frame_name)
+        frame_item.setToolTip(frame_name)
+        self.active_table.setItem(row, 1, frame_item)
         
-        val_lbl = QtWidgets.QLabel("-")
-        val_lbl.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        sig_name = self.meta[key]['sig']
+        sig_item = QtWidgets.QTableWidgetItem(sig_name)
+        sig_item.setForeground(QtGui.QBrush(self.plots[key]['color']))
+        font = sig_item.font()
+        font.setBold(True)
+        sig_item.setFont(font)
+        sig_item.setToolTip(sig_name)
+        self.active_table.setItem(row, 2, sig_item)
+        
+        val_item = QtWidgets.QTableWidgetItem("-")
+        val_item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.active_table.setItem(row, 3, val_item)
         
         del_btn = QtWidgets.QPushButton("✖")
         del_btn.setFixedSize(24, 24)
-        del_btn.clicked.connect(lambda _, r=row, k=key: self.remove_signal(k))
+        del_btn.clicked.connect(lambda checked, k=key: self.remove_signal(k))
+        self.active_table.setCellWidget(row, 4, del_btn)
 
-        self.active_table.setCellWidget(row, 0, chk)
-        self.active_table.setCellWidget(row, 1, name_lbl)
-        self.active_table.setCellWidget(row, 2, val_lbl)
-        self.active_table.setCellWidget(row, 3, del_btn)
-        self.active_table.setItem(row, 0, QtWidgets.QTableWidgetItem(key))
+    def on_active_table_item_changed(self, item):
+        if item.column() == 0:
+            key = item.data(QtCore.Qt.UserRole)
+            if key and key in self.plots:
+                is_visible = (item.checkState() == QtCore.Qt.Checked)
+                self.plots[key]['widget'].setVisible(is_visible)
 
     def remove_signal(self, key):
         for r in range(self.active_table.rowCount()):
             item = self.active_table.item(r, 0)
-            if item and item.text() == key:
+            if item and item.data(QtCore.Qt.UserRole) == key:
                 self.active_table.removeRow(r)
                 break
                 
-        pw = self.plots[key]['widget']
-        self.plot_vbox.removeWidget(pw)
-        pw.deleteLater()
-        del self.plots[key]
+        if key in self.plots:
+            pw = self.plots[key]['widget']
+            self.plot_vbox.removeWidget(pw)
+            pw.deleteLater()
+            del self.plots[key]
+            self.mark_workspace_modified()
 
     def toggle_play(self):
-        if not hasattr(self, 'blf_path') or not self.db:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please load DBC and BLF first.")
+        if not hasattr(self, 'blf_path') or not self.dbs_info:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Please load at least one DBC and a BLF file first.")
             return
 
         if not self.is_playing:
@@ -534,12 +750,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.max_time = 0.0
             self.play_pos = 0.0
             
-            target_ids = set([self.meta[k]["frame_id"] for k in self.plots.keys()])
-            if not target_ids:
+            target_keys = list(self.plots.keys())
+            if not target_keys:
                 QtWidgets.QMessageBox.information(self, "Info", "Please select at least one signal to plot first.")
                 return
 
-            self.reader = BLFReaderThread(self.blf_path, self.db, target_ids)
+            self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys)
             self.reader.data_batch_ready.connect(self.on_data_batch)
             self.reader.progress.connect(lambda n: self.status.showMessage(f"Reading... {n} target frames parsed"))
             self.reader.finished.connect(lambda: self.status.showMessage("Reading Finished / Paused"))
@@ -611,7 +827,7 @@ class MainWindow(QtWidgets.QMainWindow):
         mode = self.x_mode_combo.currentText()
         win = self.window_spin.value()
         stale_threshold = self.stale_spin.value()
-        auto_y = self.autoy_checkbox.isChecked()  # 追加: Auto Y-Fit状態の取得
+        auto_y = self.autoy_checkbox.isChecked()
         
         if mode == "Fixed Window":
             start = max(0.0, self.play_pos - win/2)
@@ -630,7 +846,10 @@ class MainWindow(QtWidgets.QMainWindow):
             if not item:
                 continue
                 
-            key = item.text()
+            key = item.data(QtCore.Qt.UserRole)
+            if not key or key not in self.plots:
+                continue
+                
             p_data = self.plots[key]
             d = self.data.get(key)
             
@@ -652,7 +871,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     t_plot = np.array(t_slice) - start
                     v_plot = np.array(v_slice)
 
-                    # --- 追加: Auto Y-Fit スケーリング処理 ---
                     if auto_y and len(v_plot) > 0:
                         vmin = np.min(v_plot)
                         vmax = np.max(v_plot)
@@ -660,7 +878,6 @@ class MainWindow(QtWidgets.QMainWindow):
                             pad = (vmax - vmin) * 0.1
                             p_data["widget"].getPlotItem().setYRange(vmin - pad, vmax + pad, padding=0)
                         else:
-                            # 値が一定の場合は上下に0.5の余白を持たせる
                             p_data["widget"].getPlotItem().setYRange(vmin - 0.5, vmax + 0.5, padding=0)
                     
                     t_step = np.repeat(t_plot, 2)[1:]
@@ -687,9 +904,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         p_data["curve"].setPen(pg.mkPen(color=p_data["color"], width=2))
                         
-                    lbl = self.active_table.cellWidget(row, 2)
-                    if lbl:
-                        lbl.setText(val_str)
+                    val_item = self.active_table.item(row, 3)
+                    if val_item:
+                        val_item.setText(val_str)
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
