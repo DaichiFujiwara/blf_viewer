@@ -1,6 +1,16 @@
-# blf_viewer.py (modified: pause stops reader, resume from last play_pos)
-# ベース: 元の blf_viewer.py を修正（参照: uploaded blf_viewer.py） 
-# 必要パッケージ: PySide6, pyqtgraph, python-can, cantools, numpy
+# blf_viewer.py
+# Modified: add thorough English comments that explain operation and rationale.
+# Base functionality:
+#  - Loads DBC files (via cantools) and displays CAN signals decoded from BLF files.
+#  - Uses a background QThread (BLFReaderThread) to stream data from BLF and emit batches to the main thread.
+#  - Play / Pause controls: on Pause the reader thread is stopped; on Resume it restarts and skips data up to the last play position.
+#
+# Requirements (pip):
+#   PySide6, pyqtgraph, python-can, cantools, numpy
+#
+# NOTE:
+#   This file preserves the original runtime behavior but replaces/expands comments with explanatory English text.
+#   Keep backups before replacing existing file.
 
 import sys
 import time
@@ -18,13 +28,31 @@ import can
 
 CONFIG_FILE = "blf_viewer_workspace.json"
 
+
+# ----------------------------
+# Helper utilities
+# ----------------------------
+
 def _try_get_attr(obj, names, default=None):
+    """
+    Try to retrieve the first available attribute from obj among names.
+    This is a small utility to extract metadata from cantools signal objects,
+    which may have different attribute names across versions.
+    """
     for n in names:
         if hasattr(obj, n):
             return getattr(obj, n)
     return default
 
+
 def get_signal_meta_from_cantools_signal(s):
+    """
+    Convert a cantools Signal object into a small metadata dict used by the UI:
+      - min / max values
+      - unit string
+      - choices (enumeration values) if present
+    This helps set axis ranges and label ticks when plotting.
+    """
     meta = {}
     meta['min'] = _try_get_attr(s, ['minimum', 'min', 'physical_minimum'], None)
     meta['max'] = _try_get_attr(s, ['maximum', 'max', 'physical_maximum'], None)
@@ -32,7 +60,19 @@ def get_signal_meta_from_cantools_signal(s):
     meta['choices'] = _try_get_attr(s, ['choices', 'enum', 'values'], None)
     return meta
 
+
+# ----------------------------
+# Custom Axis for time formatting
+# ----------------------------
+
 class TimeAxisItem(pg.AxisItem):
+    """
+    Custom axis item that formats seconds into human-friendly strings:
+      - for >= 1 hour: H:MM:SS.sss
+      - for >= 1 minute: M:SS.sss
+      - else: seconds with 3 decimals
+    This keeps time ticks readable even for long logs.
+    """
     def __init__(self, orientation='bottom', *args, **kwargs):
         super().__init__(orientation=orientation, *args, **kwargs)
 
@@ -42,7 +82,8 @@ class TimeAxisItem(pg.AxisItem):
             try:
                 t = float(v)
             except Exception:
-                out.append(str(v)); continue
+                out.append(str(v))
+                continue
             if t >= 3600:
                 h = int(t // 3600)
                 m = int((t % 3600) // 60)
@@ -54,12 +95,28 @@ class TimeAxisItem(pg.AxisItem):
                 out.append(f"{t:.3f}")
         return out
 
+
+# ----------------------------
+# BLF Reader Thread
+# ----------------------------
+
 class BLFReaderThread(QtCore.QThread):
     """
-    BLF ファイルを逐次読み込み、指定した signal keys に該当するデータをバッチで main thread に渡す。
-    変更点:
-      - resume_time (秒) を受け取り、ts < resume_time のメッセージは読み捨てることで「指定時刻から再開」を実装。
-      - stop() を呼ぶと _running を False にしてループを抜ける（即時停止を試みる）。
+    Background thread that reads CAN frames from a BLF file using python-can's BLFReader.
+
+    Key behaviors:
+      - It decodes messages according to the provided DBC(s) via cantools objects.
+      - It emits data in batches (data_batch_ready) to the main thread to avoid too-frequent cross-thread signals.
+      - On pause the main thread calls stop(), which sets _running=False; the for-loop inside run() checks this flag and exits gracefully.
+      - resume_time: when provided (float seconds), the reader will skip (discard) messages whose relative timestamp is less than resume_time.
+        This is how "resume from last play_pos" is implemented without keeping the reader active during pause.
+      - The thread emits progress signals periodically so the UI can show reading progress if desired.
+
+    Signals:
+      - data_batch_ready(dict, float): dict maps key -> {"t": [...], "v": [...]}, second arg is latest timestamp seen (relative seconds)
+      - progress(int): number of frames processed (or coarse progress indicator)
+      - finished(): emitted when the reader exits normally (either EOF or stop requested)
+      - error(str): error messages for UI reporting
     """
     data_batch_ready = QtCore.Signal(dict, float)
     progress = QtCore.Signal(int)
@@ -67,25 +124,50 @@ class BLFReaderThread(QtCore.QThread):
     error = QtCore.Signal(str)
 
     def __init__(self, blf_path, dbs_info, target_keys, resume_time=None, parent=None):
+        """
+        Parameters:
+          - blf_path: path to the BLF file to open
+          - dbs_info: list of tuples (cantools.Database, dbc_name)
+          - target_keys: list or set of keys corresponding to signals to decode and emit
+          - resume_time: if provided, skip messages whose relative timestamp < resume_time
+        """
         super().__init__(parent)
         self.blf_path = blf_path
         self.dbs_info = dbs_info
         self.target_keys = set(target_keys)
         self._running = True
-        self.resume_time = resume_time  # seconds from start (relative timestamp), None means start from beginning
+        # resume_time is number of seconds from the BLF file's first timestamp (relative)
+        # If None, reading starts from the file beginning (no skip).
+        self.resume_time = resume_time
+        # Build a quick lookup from arbitration id -> list of (cantools message, dbc_name)
+        # This accelerates per-frame decoding lookups.
         self.target_messages = defaultdict(list)
         for db, dbc_name in self.dbs_info:
             for msg in db.messages:
                 self.target_messages[msg.frame_id].append((msg, dbc_name))
 
     def stop(self):
-        # main thread が呼ぶ（Pause のとき等）
+        """
+        Request the thread to stop. The run loop must check self._running and exit.
+        This is used when the UI user presses Pause, or the app shuts down.
+        """
         self._running = False
 
     def run(self):
+        """
+        Main loop that reads from BLFReader and emits batches of decoded signals.
+
+        Implementation notes:
+          - BLFReader yields message-like objects with attributes: timestamp, arbitration_id, data
+          - We treat the first timestamp as the base and compute relative seconds (ts = raw_ts - base_ts)
+          - If resume_time is provided, messages with ts < resume_time are skipped (not decoded nor emitted).
+          - Decoding uses cantools' Message.decode; any decode errors are ignored for robustness.
+          - To limit signal emission overhead, every N frames a batch is emitted and cleared.
+        """
         try:
             reader = can.BLFReader(self.blf_path)
         except Exception as e:
+            # if opening fails, notify main thread and finish
             self.error.emit(f"BLF Open Error: {e}")
             self.finished.emit()
             return
@@ -93,72 +175,97 @@ class BLFReaderThread(QtCore.QThread):
         count = 0
         base_ts = None
         max_ts = 0.0
+        # batch: key -> {"t": [...], "v": [...]}
         batch = defaultdict(lambda: {"t": [], "v": []})
 
         for msg in reader:
-            # 停止要求があればすぐ抜ける
+            # allow quick exit if requested
             if not self._running:
                 break
 
+            # timestamp retrieval can occasionally fail; guard it
             try:
                 raw_ts = float(msg.timestamp)
             except Exception:
-                # タイムスタンプが取得できないならスキップ
+                # skip messages without timestamp
                 continue
 
             if base_ts is None:
+                # establish the zero point of the relative timeline
                 base_ts = raw_ts
             ts = raw_ts - base_ts
 
-            # resume_time が指定されていれば、それより前のデータは読み捨てる（スキップ）
+            # If resume_time is set (we are resuming), drop earlier messages until we reach resume_time
             if self.resume_time is not None and ts < self.resume_time:
+                # reading and discarding until we reach resume_time
                 continue
 
             arb = msg.arbitration_id
             msgs_to_try = self.target_messages.get(arb)
             if not msgs_to_try:
+                # we don't have DBC info for this arbitration id, skip
                 continue
 
             count += 1
             if ts > max_ts:
                 max_ts = ts
 
+            # try decoding with each message definition matching the arbitration id
             for message, dbc_name in msgs_to_try:
                 try:
                     decoded = message.decode(msg.data)
+                    # decoded is a dict: signal_name -> value
                     for sname, sval in decoded.items():
                         key = f"{dbc_name}:{arb}:{message.name}:{sname}"
                         if key in self.target_keys:
                             batch[key]["t"].append(ts)
                             batch[key]["v"].append(sval)
                 except Exception:
-                    # デコードエラー等は無視して先に進める
+                    # if decode fails for one message, skip it but continue other possibilities
                     pass
 
-            # 定期的にバッチを送る（負荷を分散）
+            # periodically emit a batch to reduce signal frequency overhead.
+            # The modulus threshold (10000) is tuned for large files; you may lower it for more responsive UI.
             if count % 10000 == 0:
+                # emit a shallow copy (dict) to transfer ownership safely between threads
                 self.data_batch_ready.emit(dict(batch), max_ts)
                 batch.clear()
                 self.progress.emit(count)
 
-        # 残りを送る
+        # emit any remaining collected data
         if batch:
             self.data_batch_ready.emit(dict(batch), max_ts)
 
         try:
             reader.close()
         except Exception:
+            # closing failure is non-fatal; we just ignore it
             pass
 
+        # final signal to indicate the reader has stopped
         self.finished.emit()
 
+
+# ----------------------------
+# Small UI helper widgets
+# ----------------------------
+
 class CheckableListWidget(QtWidgets.QListWidget):
+    """
+    A QListWidget that supports shift-click range checking.
+    This is used for multi-selecting signal checkboxes in the selection dialogs.
+    """
     def __init__(self, parent=None):
         super().__init__(parent)
         self.last_clicked_row = -1
         self.itemClicked.connect(self.on_item_clicked)
 
     def on_item_clicked(self, item):
+        """
+        When a user clicks an item with Shift pressed, copy the checkbox state across
+        the range between the last-clicked and current clicked rows. This mimics
+        typical file-selection behavior and speeds up selection when many signals exist.
+        """
         current_row = self.row(item)
         modifiers = QtGui.QGuiApplication.keyboardModifiers()
 
@@ -173,7 +280,12 @@ class CheckableListWidget(QtWidgets.QListWidget):
 
         self.last_clicked_row = current_row
 
+
 class SignalSelectionDialog(QtWidgets.QDialog):
+    """
+    Dialog to display all signals for a given message/frame so the user can pick which signals to activate.
+    The list shows the signal name (and unit if present).
+    """
     def __init__(self, dbc_name, frame_id, frame_name, signals, selected_keys, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Select Signals - {frame_name} ({hex(frame_id)})")
@@ -183,11 +295,13 @@ class SignalSelectionDialog(QtWidgets.QDialog):
         self.list_widget = CheckableListWidget()
         layout.addWidget(self.list_widget)
 
+        # Populate the list widget with signals as checkable items.
         for sig in signals:
             key = f"{dbc_name}:{frame_id}:{frame_name}:{sig['name']}"
-            unit_str = f" [{sig['unit']}]" if sig['unit'] else ""
+            unit_str = f" [{sig['unit']}]" if sig.get('unit') else ""
             item = QtWidgets.QListWidgetItem(f"{sig['name']}{unit_str}")
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            # check initial state based on existing selection
             if key in selected_keys:
                 item.setCheckState(QtCore.Qt.Checked)
             else:
@@ -201,13 +315,21 @@ class SignalSelectionDialog(QtWidgets.QDialog):
         layout.addWidget(btn_box)
 
     def accept(self):
+        """
+        When the user accepts the dialog, collect the checked keys and close.
+        """
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.checkState() == QtCore.Qt.Checked:
                 self.result_keys.append(item.data(QtCore.Qt.UserRole))
         super().accept()
 
+
 class GlobalSearchDialog(QtWidgets.QDialog):
+    """
+    Dialog that allows text search across all frames/signals loaded from DBCs.
+    This is useful when many DBCs/frames exist and the user wants to quickly find signals.
+    """
     def __init__(self, meta_dict, selected_keys, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Global Search (Frame / Signal)")
@@ -222,6 +344,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
         self.list_widget = CheckableListWidget()
         layout.addWidget(self.list_widget)
 
+        # Fill list with human-friendly strings for each signal metadata entry
         for key, m in self.meta_dict.items():
             fid_hex = hex(m['frame_id'])
             dbc_name = m.get('dbc_name', 'Unknown')
@@ -241,51 +364,86 @@ class GlobalSearchDialog(QtWidgets.QDialog):
         layout.addWidget(btn_box)
 
     def filter_list(self, text):
+        """
+        Filter visible list items by the search query (case-insensitive).
+        """
         query = text.lower()
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             item.setHidden(query not in item.text().lower())
+        # reset shift-select state to avoid accidental multi-range selections after filtering
         self.list_widget.last_clicked_row = -1
 
     def accept(self):
+        """
+        Collect checked keys and close the dialog.
+        """
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.checkState() == QtCore.Qt.Checked:
                 self.result_keys.append(item.data(QtCore.Qt.UserRole))
         super().accept()
 
+
+# ----------------------------
+# Main Window
+# ----------------------------
+
 class MainWindow(QtWidgets.QMainWindow):
+    """
+    The main application window that manages:
+      - loading DBC files
+      - opening BLF files
+      - selecting which signals to plot
+      - launching and stopping the BLFReaderThread
+      - plotting data with pyqtgraph and showing current values in a table
+    Behavior highlights:
+      - On Play: if resume_ts is None, start fresh (data cleared). If resume_ts is set (after a Pause), keep existing data and start the reader with resume_time=resume_ts so the reader skips up to that timestamp.
+      - On Pause: the reader thread's stop() is called and resume_ts is set to the current play_pos; the UI timer stops updating playback position.
+      - update_plots_and_table handles slicing of per-signal arrays for display using bisect for efficient index lookup.
+    """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BLF Viewer")
+        self.setWindowTitle("BLF Viewer (modified, commented)")
         self.resize(1400, 850)
+        # set pyqtgraph colors: white background, black foreground
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
         pg.setConfigOptions(antialias=False)
 
-        self.dbs_info = []
-        self.dbc_paths = []
-        self.meta = {}
+        # application state
+        self.dbs_info = []     # list of tuples (cantools.Database, dbc_basename)
+        self.dbc_paths = []    # list of loaded DBC file paths
+        self.meta = {}         # meta info for each signal key used by UI / export
+        # self.data maps key -> {"t": [times], "v_raw": [original values], "v_num": [numeric mapped values]}
         self.data = defaultdict(lambda: {"t": [], "v_raw": [], "v_num": []})
-        self.plots = {}
-        self.max_time = 0.0
-        self.play_pos = 0.0
+        self.plots = {}        # active plot entries keyed by signal key
+        self.max_time = 0.0    # maximum observed time across all parsed data
+        self.play_pos = 0.0    # current playback position in seconds
         self.current_display_start = 0.0
         self.is_workspace_modified = False
 
-        # resume 時刻（秒）を保持。Pause で保存し、Resume で利用する
+        # resume timestamp in seconds. Set when Paused; cleared/used when Play/Resume.
         self.resume_ts = None
 
-        # initialize active_state for stale hysteresis if needed later
+        # additional state for UI (stale detection etc.)
         self.active_state = {}
 
+        # build UI and timers
         self.setup_ui()
         self.load_config()
         self.setup_timers()
+        # create Save shortcut
         save_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Save, self)
         save_shortcut.activated.connect(self.manual_save)
 
     def setup_ui(self):
+        """
+        Build the main toolbar and central UI layout:
+          - Left: DBC frames list + active signal table
+          - Right: Scrollable plot area for selected signals + timeline slider
+          - Toolbar: Open BLF, Add DBC(s), Search, Play/Pause, Speed, Export
+        """
         tb = self.addToolBar("Main")
         tb.setMovable(False)
         act_blf = QtGui.QAction("📂 Open BLF", self); act_blf.triggered.connect(self.open_blf)
@@ -296,36 +454,44 @@ class MainWindow(QtWidgets.QMainWindow):
         act_search = QtGui.QAction("🔍 Search", self); act_search.triggered.connect(self.open_global_search)
         tb.addAction(act_search)
         tb.addSeparator()
+        # X-axis mode selection: Fixed Window, Follow trailing window, Auto Fit to data
         self.x_mode_combo = QtWidgets.QComboBox()
         self.x_mode_combo.addItems(["Fixed Window", "Follow (Trailing)", "Auto Fit"])
         self.x_mode_combo.currentIndexChanged.connect(self.mark_workspace_modified)
         self.x_mode_combo.currentIndexChanged.connect(lambda: self.update_plots_and_table())
         tb.addWidget(QtWidgets.QLabel(" X-Mode: ")); tb.addWidget(self.x_mode_combo)
+        # window span for Fixed/Follow modes (seconds)
         self.window_spin = QtWidgets.QDoubleSpinBox(); self.window_spin.setRange(0.1, 3600.0);
         self.window_spin.setValue(5.0); self.window_spin.setSingleStep(0.5)
         self.window_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Window(s): ")); tb.addWidget(self.window_spin)
+        # auto Y-fit option
         self.autoy_checkbox = QtWidgets.QCheckBox(" Auto Y-Fit "); self.autoy_checkbox.toggled.connect(self.mark_workspace_modified)
         tb.addWidget(self.autoy_checkbox)
         tb.addSeparator()
+        # stale detection threshold
         self.stale_spin = QtWidgets.QDoubleSpinBox(); self.stale_spin.setRange(0.1, 3600.0); self.stale_spin.setSingleStep(0.5); self.stale_spin.setValue(2.0)
         self.stale_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Stale(s): ")); tb.addWidget(self.stale_spin)
         tb.addSeparator()
+        # play / pause button
         self.play_btn = QtWidgets.QPushButton("▶ Play / Load"); self.play_btn.clicked.connect(self.toggle_play)
         tb.addWidget(self.play_btn)
+        # playback speed multiplier
         self.speed_spin = QtWidgets.QDoubleSpinBox(); self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setValue(1.0); self.speed_spin.setSuffix("x")
         self.speed_spin.valueChanged.connect(self.mark_workspace_modified)
         tb.addWidget(QtWidgets.QLabel(" Speed: ")); tb.addWidget(self.speed_spin)
         tb.addSeparator()
+        # export action
         act_export = QtGui.QAction("💾 Export CSV", self); act_export.triggered.connect(self.export_csv); tb.addAction(act_export)
 
+        # central layout: left (frames + active table) and right (plots)
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         main_layout = QtWidgets.QVBoxLayout(central); main_layout.setContentsMargins(4,4,4,4)
         h_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         v_splitter_left = QtWidgets.QSplitter(QtCore.Qt.Vertical)
 
-        # Frames list
+        # Frames tree (double-click to select signals for a message)
         frame_group = QtWidgets.QGroupBox("1. Frames (Double-click)")
         frame_layout = QtWidgets.QVBoxLayout(frame_group)
         self.frame_tree = QtWidgets.QTreeWidget(); self.frame_tree.setHeaderLabels(["DBC","ID","Message"])
@@ -336,11 +502,12 @@ class MainWindow(QtWidgets.QMainWindow):
         header_tree.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
         header_tree.setStretchLastSection(True)
         self.frame_tree.setColumnWidth(0, 100); self.frame_tree.setColumnWidth(1, 60)
+        # double click signal -> open signal selection dialog (SignalSelectionDialog)
         self.frame_tree.itemDoubleClicked.connect(self.open_signal_popup)
         frame_layout.addWidget(self.frame_tree)
         v_splitter_left.addWidget(frame_group)
 
-        # Active table
+        # Active signals table: shows visibility checkbox, frame, signal, current value, and remove button
         active_group = QtWidgets.QGroupBox("2. Active Signals & Values")
         active_layout = QtWidgets.QVBoxLayout(active_group)
         self.active_table = QtWidgets.QTableWidget(0,5)
@@ -356,11 +523,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active_table.setColumnWidth(1,100); self.active_table.setColumnWidth(2,120); self.active_table.setColumnWidth(3,80)
         self.active_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.active_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        # when the visibility checkbox changes, update plot visibility
         self.active_table.itemChanged.connect(self.on_active_table_item_changed)
         active_layout.addWidget(self.active_table)
         v_splitter_left.addWidget(active_group)
 
-        # Plots
+        # Plot area: scrollable container where each active signal gets a small plot widget
         plot_group = QtWidgets.QGroupBox("3. Signal Plots")
         plot_layout = QtWidgets.QVBoxLayout(plot_group)
         self.plot_scroll = QtWidgets.QScrollArea(); self.plot_scroll.setWidgetResizable(True)
@@ -368,6 +536,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plot_vbox.setContentsMargins(0,0,0,0); self.plot_vbox.addStretch()
         self.plot_scroll.setWidget(self.plot_container)
         plot_layout.addWidget(self.plot_scroll)
+        # timeline slider and label
         slider_layout = QtWidgets.QHBoxLayout()
         self.time_label = QtWidgets.QLabel("Time: 0.000 s")
         self.slider = QtWidgets.QSlider(QtCore.Qt.Horizontal); self.slider.setRange(0,10000); self.slider.sliderMoved.connect(self.on_slider_moved)
@@ -379,13 +548,26 @@ class MainWindow(QtWidgets.QMainWindow):
         self.status = self.statusBar()
 
     def mark_workspace_modified(self, *args):
+        """
+        Mark that workspace settings have changed (so we can offer Save on exit).
+        """
         self.is_workspace_modified = True
 
     def manual_save(self):
+        """
+        Manual save action triggered by toolbar or shortcut.
+        """
         self.save_config()
         self.status.showMessage("Workspace saved successfully.", 3000)
 
     def load_config(self):
+        """
+        Load workspace configuration from CONFIG_FILE:
+          - ui mode, window span, auto-y, stale time, speed
+          - last used DBC list and BLF path
+          - selected signals saved across runs
+        If values are missing or file does not exist, default_config is used.
+        """
         default_config = {"x_mode":"Fixed Window","window_span":5.0,"auto_y":False,"stale_time":2.0,"speed":1.0,"dbc_paths":[],"blf_path":None,"selected_signals":[]}
         if os.path.exists(CONFIG_FILE):
             try:
@@ -401,13 +583,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if valid_dbcs: self._load_dbc_files(valid_dbcs)
         blf_path = default_config["blf_path"]
         if blf_path and os.path.exists(blf_path):
-            self.blf_path = blf_path; self.status.showMessage(f"Selected BLF: {self.blf_path}")
+            self.blf_path = blf_path; self.status.showMessage(f"Selected BLF: {blf_path}")
         for key in default_config["selected_signals"]:
             if key in self.meta and key not in self.plots:
                 self.add_signal_plot(key)
         self.is_workspace_modified = False
 
     def save_config(self):
+        """
+        Save workspace config to CONFIG_FILE for next session.
+        """
         config = {"x_mode":self.x_mode_combo.currentText(),"window_span":self.window_spin.value(),"auto_y":self.autoy_checkbox.isChecked(),"stale_time":self.stale_spin.value(),"speed":self.speed_spin.value(),"dbc_paths":self.dbc_paths,"blf_path":getattr(self,'blf_path',None),"selected_signals":list(self.plots.keys())}
         try:
             with open(CONFIG_FILE,"w",encoding="utf-8") as f: json.dump(config,f,indent=4)
@@ -416,10 +601,13 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Failed to save workspace: {e}")
 
     def closeEvent(self, event):
-        # スレッドを停止してから閉じるようにする
+        """
+        On window close, attempt to stop any running reader thread cleanly,
+        then ask the user to save workspace if there are unsaved changes.
+        """
         try:
             if hasattr(self, 'reader') and getattr(self, 'reader') is not None and getattr(self, 'reader').isRunning():
-                # ユーザーが閉じる際は reader を停止して少し待つ
+                # request stop and wait briefly for the thread to exit
                 self.reader.stop()
                 self.reader.wait(1000)
         except Exception:
@@ -437,16 +625,27 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
 
     def setup_timers(self):
+        """
+        Initialize timers used by the app:
+          - play_timer: advances playback position when playing
+          - ui_timer: periodic UI updates (plot redraws / table updates)
+        """
         self.is_playing = False
         self.play_timer = QtCore.QTimer(); self.play_timer.timeout.connect(self.advance_playback)
-        self.play_timer.setInterval(50)
+        self.play_timer.setInterval(50)  # control playback granularity / responsiveness
         self.ui_timer = QtCore.QTimer(); self.ui_timer.setInterval(100); self.ui_timer.timeout.connect(self.update_plots_and_table); self.ui_timer.start()
 
     def add_dbc_dialog(self):
+        """
+        Show file dialog to add one or more DBC files. After selecting, call _load_dbc_files.
+        """
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(self,"Add DBC(s)","","DBC Files (*.dbc)")
         if paths: self._load_dbc_files(paths)
 
     def _load_dbc_files(self, paths):
+        """
+        Load the selected DBC files using cantools and populate the frames tree and internal metadata.
+        """
         loaded_any = False
         for path in paths:
             if path in self.dbc_paths: continue
@@ -454,6 +653,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 db = cantools.database.load_file(path); dbc_name = os.path.basename(path)
                 self.dbs_info.append((db, dbc_name)); self.dbc_paths.append(path)
                 for msg in db.messages:
+                    # create a tree item for this frame/message
                     is_first_msg = True
                     display_dbc = dbc_name if is_first_msg else ""
                     is_first_msg = False
@@ -461,6 +661,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     item.setToolTip(0, dbc_name); item.setToolTip(2, msg.name)
                     item.setData(0, QtCore.Qt.UserRole, msg.frame_id)
                     item.setData(1, QtCore.Qt.UserRole, dbc_name)
+                    # register signals metadata for global search / export
                     for s in msg.signals:
                         key = f"{dbc_name}:{msg.frame_id}:{msg.name}:{s.name}"
                         sm = get_signal_meta_from_cantools_signal(s)
@@ -472,11 +673,18 @@ class MainWindow(QtWidgets.QMainWindow):
         if loaded_any: self.mark_workspace_modified()
 
     def open_blf(self):
+        """
+        Prompt for a BLF file path and store it for subsequent reading.
+        """
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self,"Open BLF","","BLF Files (*.blf)")
         if path:
             self.blf_path = path; self.status.showMessage(f"Selected BLF: {path}"); self.mark_workspace_modified()
 
     def open_signal_popup(self, item, column):
+        """
+        On double-clicking a frame tree row, open a dialog listing all signals in that message,
+        so the user can choose which signals to add to the active plot list.
+        """
         frame_id = item.data(0, QtCore.Qt.UserRole); dbc_name = item.data(1, QtCore.Qt.UserRole); msg_name = item.text(2)
         if frame_id is None or dbc_name is None: return
         signals = [{"name": v["sig"], "unit": v["unit"]} for k,v in self.meta.items() if v["frame_id"]==frame_id and v["dbc_name"]==dbc_name and v["msg"]==msg_name]
@@ -487,6 +695,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 if key not in self.plots: self.add_signal_plot(key)
 
     def open_global_search(self):
+        """
+        Open the global search dialog that lists all known signals across loaded DBC(s).
+        """
         if not self.meta:
             QtWidgets.QMessageBox.warning(self, "Warning", "Please load a DBC file first."); return
         dialog = GlobalSearchDialog(self.meta, list(self.plots.keys()), self)
@@ -495,6 +706,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 if key not in self.plots: self.add_signal_plot(key)
 
     def export_csv(self):
+        """
+        Export currently selected signals to CSV with a common time axis.
+        For each distinct time across all plotted signals, write a row with the nearest previous value for each signal.
+        This is a simple export suitable for offline analysis.
+        """
         if not self.plots:
             QtWidgets.QMessageBox.warning(self,"No Signals","Please select and plot signals to export."); return
         path,_ = QtWidgets.QFileDialog.getSaveFileName(self,"Save CSV","can_data_export.csv","CSV Files (*.csv')")
@@ -520,6 +736,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QMessageBox.critical(self,"Export Error", str(e))
 
     def add_signal_plot(self, key):
+        """
+        Add a new plot widget for the given signal key and register it in:
+          - self.plots: holds widget, curve, meta, color, axis_applied flag
+          - the active table (with visibility checkbox and remove button)
+        The plotting uses pyqtgraph.PlotWidget with downsampling and clipping enabled to handle large datasets.
+        """
         meta = self.meta[key]
         color = pg.intColor(len(self.plots), hues=15)
         axis = TimeAxisItem(orientation='bottom')
@@ -529,27 +751,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if meta['unit']: title += f" [{meta['unit']}]"
         pi.setTitle(title, size="10pt")
         curve = pi.plot([], [], pen=pg.mkPen(color=color, width=2))
+        # performance-related settings
         curve.setClipToView(True)
         curve.setDownsampling(ds=True, auto=True, method='peak')
+        # try to link X axis across multiple plots for synchronized zoom/pan
         for other in self.plots.values():
             try:
                 pi.setXLink(other['widget'].getPlotItem())
             except Exception:
                 pass
         self.plot_vbox.insertWidget(self.plot_vbox.count() - 1, pw)
-        # store
+        # store plot entry
         self.plots[key] = {"widget": pw, "curve": curve, "meta": meta, "color": color, "axis_applied": False}
-        # apply DBC meta to axis (NEW)
+        # apply DBC-provided axis settings (choices / min / max) if available
         self.apply_meta_to_axis(key)
         self.add_to_active_table(key)
         self.mark_workspace_modified()
 
     def apply_meta_to_axis(self, key):
         """
-        Apply DBC signal meta (choices/min/max/unit) to the plot's Y axis.
-        - If choices (enum) exist: set left axis ticks to the labels and set range.
-        - Else if min/max exist: set YRange accordingly with small padding.
-        - Else do nothing (auto-y can be applied at draw time).
+        Use DBC metadata to apply Y-axis ticks or range:
+          - If 'choices' (enum) exist, create textual ticks on the left axis and set range.
+          - Else if numeric min/max exist, set the Y range with a small padding.
+          - Otherwise leave axis_autoscaling to the periodic update function.
+        We mark axis_applied True when we have applied DBC-driven axis settings.
         """
         if key not in self.plots:
             return
@@ -557,11 +782,11 @@ class MainWindow(QtWidgets.QMainWindow):
         pi = entry["widget"].getPlotItem()
         meta = entry.get("meta", {}) or {}
         choices = meta.get("choices"); minv = meta.get("min"); maxv = meta.get("max")
-        # choices: try to build tick list (numeric value -> label)
+        # If choices dictionary is present, convert it to ticks [(value,label), ...]
         if choices and isinstance(choices, dict) and len(choices) > 0:
             tick_items = []
             numeric_keys = []
-            # Cantools choices keys may be ints or strings; normalize
+            # Cantools choices keys may be ints or strings; normalize to numeric where possible
             for kk, lbl in choices.items():
                 try:
                     nk = float(kk)
@@ -589,7 +814,7 @@ class MainWindow(QtWidgets.QMainWindow):
                         pass
                 entry["axis_applied"] = True
                 return
-        # numeric min/max
+        # numeric min/max from DBC: apply a range with small padding
         if (isinstance(minv, (int, float)) and isinstance(maxv, (int, float)) and maxv > minv):
             try:
                 span = float(maxv) - float(minv)
@@ -599,10 +824,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
             entry["axis_applied"] = True
             return
-        # else mark as applied = False; auto Y will be used during update_plots_and_table
-        entry["axis_applied"] = False
+        # else: axis_applied stays False and auto-Y logic will apply during plotting
 
     def add_to_active_table(self, key):
+        """
+        Add a row to the active signals table with:
+          - a checkbox that controls visibility
+          - frame/message name
+          - signal name (colored)
+          - current value (updated periodically)
+          - remove button
+        """
         row = self.active_table.rowCount(); self.active_table.insertRow(row)
         chk_item = QtWidgets.QTableWidgetItem()
         chk_item.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
@@ -621,6 +853,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.active_table.setCellWidget(row, 4, del_btn)
 
     def on_active_table_item_changed(self, item):
+        """
+        Handle visibility checkbox toggles by hiding/showing the corresponding plot widget.
+        """
         if item.column() == 0:
             key = item.data(QtCore.Qt.UserRole)
             if key and key in self.plots:
@@ -628,6 +863,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.plots[key]['widget'].setVisible(is_visible)
 
     def remove_signal(self, key):
+        """
+        Remove a signal from the active table and delete its associated plot widget.
+        """
         for r in range(self.active_table.rowCount()):
             item = self.active_table.item(r, 0)
             if item and item.data(QtCore.Qt.UserRole) == key:
@@ -638,45 +876,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def toggle_play(self):
         """
-        Play / Pause のトグル。
-        - Play 押下:
-            - self.resume_ts が None => 新規読み込み（data をクリアして先頭から読み始める）
-            - self.resume_ts がある => Pause 解除（data を保持し resume_ts からスキップして再開）
-        - Pause 押下:
-            - self.resume_ts = self.play_pos を保存して reader.stop() を呼ぶ（読み取りを止める）
+        Toggle Play / Pause behavior.
+
+        Play behavior:
+          - If resume_ts is None: treat as a fresh playback; clear internal buffers and start reader from beginning.
+          - If resume_ts is set: this is a resume after Pause; keep existing data buffers and start reader with resume_time=resume_ts to skip already-played data.
+
+        Pause behavior:
+          - Save the current play_pos into self.resume_ts and call reader.stop() to halt the background reading thread.
+          - The reader will exit quickly (upon next loop iteration) and emit finished; UI indicates paused state.
         """
         if not hasattr(self, 'blf_path') or not self.dbs_info:
             QtWidgets.QMessageBox.warning(self,"Warning","Please load at least one DBC and a BLF file first."); return
 
         if not self.is_playing:
-            # Play / Resume
+            # Play or Resume
             target_keys = list(self.plots.keys())
             if not target_keys:
                 QtWidgets.QMessageBox.information(self,"Info","Please select at least one signal to plot first."); return
 
             resume_ts = getattr(self, 'resume_ts', None)
             if resume_ts is None:
-                # 新規再生: 既存データはクリアして先頭から開始
+                # Fresh start: clear existing data and reset play position
                 self.data.clear(); self.max_time = 0.0; self.play_pos = 0.0
                 self.status.showMessage("Starting playback from beginning...")
             else:
-                # 再開: data は保持、play_pos は resume_ts のままにする
+                # Resuming after Pause: keep existing data; set play_pos to the resume timestamp
                 self.play_pos = resume_ts
                 self.status.showMessage(f"Resuming playback from {resume_ts:.3f} s...")
 
-            # reader に resume_time を渡す（None なら先頭から）
+            # Create and start the reader thread, passing resume_time if present.
             self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys, resume_time=resume_ts)
             self.reader.data_batch_ready.connect(self.on_data_batch)
             self.reader.progress.connect(lambda n: self.status.showMessage(f"Reading... {n} target frames parsed"))
-            # スレッド終了時は _on_reader_finished を呼ぶ
             self.reader.finished.connect(self._on_reader_finished)
             self.reader.error.connect(lambda s: self.status.showMessage(s))
             self.reader.start()
             self.is_playing = True; self.play_btn.setText("⏸ Pause"); self.play_timer.start()
         else:
-            # Pause 押下: 読み取りを止め、次回再開時にここから再開する
+            # Pause: store current playback position and request the reader to stop
             try:
-                # 現在の再生位置を保存
                 self.resume_ts = float(self.play_pos)
             except Exception:
                 self.resume_ts = getattr(self, 'play_pos', 0.0)
@@ -689,13 +928,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status.showMessage(f"Paused at {self.resume_ts:.3f} s")
 
     def _on_reader_finished(self):
-        # スレッド終了後のクリーンアップ
+        """
+        Called when the BLFReaderThread emits finished (either EOF or stop requested).
+        We clear the reference so a new thread can be created on next Play.
+        """
         try:
-            # reader が終了したらオブジェクト解放できるようにする
             self.reader = None
         except Exception:
             pass
-        # 状態に応じてメッセージを出す
         if getattr(self, 'resume_ts', None) is not None and not self.is_playing:
             self.status.showMessage("Paused")
         else:
@@ -703,16 +943,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @QtCore.Slot(dict, float)
     def on_data_batch(self, batch, new_max_time):
-        # データを受け取って internal buffer に追加。max_time を更新。
+        """
+        Slot to receive batches of decoded signal values from the reader thread.
+
+        The batch format:
+          { key: {"t": [t1,t2,...], "v": [v1,v2,...]}, ... }
+        We append these to internal buffers (self.data). v_raw keeps original values (strings/enums),
+        and v_num stores numeric-mapped values for plotting (attempted conversion, enums mapped to numeric keys).
+        """
         if new_max_time > self.max_time: self.max_time = new_max_time
         for key, new_data in batch.items():
             if key not in self.data: self.data[key] = {"t": [], "v_raw": [], "v_num": []}
+            # Append timestamps and raw values
             self.data[key]["t"].extend(new_data["t"]); self.data[key]["v_raw"].extend(new_data["v"])
+            # Map values to numeric form for plotting
             choices = self.meta.get(key, {}).get("choices")
             nums = []
             for val in new_data["v"]:
-                if isinstance(val, (int, float)): nums.append(float(val))
+                if isinstance(val, (int, float)):
+                    nums.append(float(val))
                 elif choices:
+                    # if DBC specified enumerations, try to map textual labels to numeric keys
                     mapped = 0.0
                     for k_c, lbl in choices.items():
                         if str(lbl) == str(val) or k_c == val:
@@ -724,21 +975,25 @@ class MainWindow(QtWidgets.QMainWindow):
                     try: nums.append(float(val))
                     except: nums.append(0.0)
             self.data[key]["v_num"].extend(nums)
-            # After new data arrives, if axis not applied (no DBC min/max/choices), we may still want auto Y next draw.
-            # If DBC min/max/choices exist and axis not yet applied, call apply_meta_to_axis to enforce.
+            # If the plot for this key exists and no axis has been applied (by DBC), attempt to apply now.
             if key in self.plots:
                 if not self.plots[key].get("axis_applied", False):
                     self.apply_meta_to_axis(key)
 
     def advance_playback(self):
+        """
+        Called by play_timer to advance the logical playback position (self.play_pos).
+        The increment dt is scaled by the speed multiplier.
+        For Follow (Trailing) mode, if the reader is active, play_pos follows the latest parsed timestamp (low-latency).
+        Otherwise, it advances linearly and is clamped to max_time.
+        """
         dt = 0.05 * max(0.001, float(self.speed_spin.value()))
-        # If reader is running and mode is Follow (Trailing), keep play_pos synced to latest received time
         try:
             mode = self.x_mode_combo.currentText()
         except Exception:
             mode = 'Fixed Window'
+        # If following trailing and the reader is running, keep play_pos at the newest available time
         if hasattr(self, 'reader') and getattr(self, 'reader') is not None and getattr(self, 'reader').isRunning() and mode == 'Follow (Trailing)':
-            # sync to latest available timestamp for minimal latency
             if self.max_time is not None:
                 self.play_pos = self.max_time
         else:
@@ -752,11 +1007,25 @@ class MainWindow(QtWidgets.QMainWindow):
             self.slider.blockSignals(False)
 
     def on_slider_moved(self, val):
+        """
+        When the user moves the timeline slider, update play_pos and refresh plots.
+        """
         if self.max_time > 0:
             self.play_pos = (val / 10000.0) * self.max_time
             self.update_plots_and_table()
 
     def update_plots_and_table(self):
+        """
+        Periodic UI update that:
+          - updates the time label
+          - computes the current display window [start, end] based on X-mode
+          - for each active plotted signal, uses bisect to find indices for the time slice and sets plot data
+          - performs 'stepify' to draw each sample as a hold/step plot (repeat points)
+          - updates current value cell with stale detection based on stale_threshold
+        Optimization notes:
+          - large slices are down-sampled with a simple step to limit plot points (cap ~30000 samples)
+          - numpy arrays are used for min/max computations for auto-Y scaling
+        """
         if not self.plots:
             return
         self.time_label.setText(f"Time: {self.play_pos:.3f} s")
@@ -765,14 +1034,14 @@ class MainWindow(QtWidgets.QMainWindow):
         stale_threshold = float(self.stale_spin.value())
         auto_y = self.autoy_checkbox.isChecked()
 
-        # --- Follow (Trailing) / Fixed Window / Auto Fit handling ---
+        # determine the time window to display based on X-mode
         if mode == "Fixed Window":
             start = max(0.0, self.play_pos - win/2)
             end = start + win
         elif mode == "Follow (Trailing)":
             end = max(0.0, self.play_pos)
             start = max(0.0, end - win)
-        else:  # Auto Fit
+        else:  # Auto Fit: compute min/max across available data
             times = []
             for k in self.plots.keys():
                 d = self.data.get(k)
@@ -784,9 +1053,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 start = max(0.0, min(times) - 0.5); end = max(times) + 0.5
                 if end - start < 1e-6: end = start + max(0.5, win)
 
-        self.current_display_start = start  # TimeAxisItem will use this for tick labels
+        self.current_display_start = start
         window_span = max(1e-6, end - start)
 
+        # iterate active table rows to refresh each plot and value cell
         for row in range(self.active_table.rowCount()):
             item = self.active_table.item(row, 0)
             if not item:
@@ -800,19 +1070,19 @@ class MainWindow(QtWidgets.QMainWindow):
             d = self.data.get(key)
             if d and len(d["t"]) > 0:
                 t_list = d["t"]
-                # choose indices within window
+                # find indices within current window using bisect (O(log n))
                 idx_start = bisect.bisect_left(t_list, start)
                 idx_end = bisect.bisect_right(t_list, end)
                 if idx_end > idx_start:
                     t_slice = t_list[idx_start:idx_end]
                     v_slice = d["v_num"][idx_start:idx_end]
-                    # heavy-data guard
+                    # guard against extremely large arrays: crude downsample by stepping
                     if len(t_slice) > 30000:
                         step = max(1, len(t_slice) // 30000)
                         t_slice = t_slice[::step]; v_slice = v_slice[::step]
                     t_plot = np.array(t_slice)
                     v_plot = np.array(v_slice)
-                    # Auto Y-scale if enabled or axis not applied
+                    # Auto Y-scaling if enabled or no DBC-provided axis applied
                     if (auto_y or not p_data.get("axis_applied", False)) and len(v_plot) > 0:
                         vmin = np.min(v_plot); vmax = np.max(v_plot)
                         if vmax > vmin:
@@ -826,18 +1096,20 @@ class MainWindow(QtWidgets.QMainWindow):
                                 p_data["widget"].getPlotItem().setYRange(vmin - 0.5, vmax + 0.5, padding=0)
                             except Exception:
                                 pass
-                    # stepify to create hold-like step display
+                    # create a step-like curve by repeating points:
+                    # e.g., t: [t0,t1] -> [t0, t0, t1], v: [v0,v1] -> [v0, v0, v1]
                     if len(t_plot) > 0:
                         t_step = np.repeat(t_plot, 2)[1:]
                         v_step = np.repeat(v_plot, 2)[:-1]
                         p_data["curve"].setData(t_step, v_step)
                 else:
+                    # no data in this window: clear the curve
                     p_data["curve"].setData([], [])
                 try:
                     p_data["widget"].getPlotItem().setXRange(start, end, padding=0)
                 except Exception:
                     pass
-                # current value display with stale check
+                # update the current value shown in the active table (nearest previous sample to play_pos)
                 idx_cur = bisect.bisect_right(t_list, self.play_pos) - 1
                 if idx_cur >= 0:
                     age = self.play_pos - t_list[idx_cur]
@@ -847,6 +1119,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     unit = p_data['meta'].get('unit', "")
                     if unit:
                         val_str += f" {unit}"
+                    # visually indicate stale signals by changing curve pen to grey dashed
                     if is_stale:
                         val_str += " (stale)"
                         p_data["curve"].setPen(pg.mkPen(color=(160,160,160), width=1.5, style=QtCore.Qt.DashLine))
@@ -856,12 +1129,22 @@ class MainWindow(QtWidgets.QMainWindow):
                     if val_item:
                         val_item.setText(val_str)
 
+
+# ----------------------------
+# Application entrypoint
+# ----------------------------
+
 def main():
+    """
+    Create and run the Qt application. This is the standard entrypoint when running
+    the script directly (python blf_viewer.py).
+    """
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == "__main__":
     main()
