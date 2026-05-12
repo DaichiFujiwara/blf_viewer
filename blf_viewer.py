@@ -1,6 +1,6 @@
-# blf_viewer_fixed.py
-# 元ファイルをベースに Follow モードと Y-axis の DBC 適用を修正した完全版
-# 必要: pip install PySide6 pyqtgraph python-can cantools numpy
+# blf_viewer.py (modified: pause stops reader, resume from last play_pos)
+# ベース: 元の blf_viewer.py を修正（参照: uploaded blf_viewer.py） 
+# 必要パッケージ: PySide6, pyqtgraph, python-can, cantools, numpy
 
 import sys
 import time
@@ -33,20 +33,16 @@ def get_signal_meta_from_cantools_signal(s):
     return meta
 
 class TimeAxisItem(pg.AxisItem):
-    def __init__(self, orientation='bottom', time_start_cb=None, *args, **kwargs):
+    def __init__(self, orientation='bottom', *args, **kwargs):
         super().__init__(orientation=orientation, *args, **kwargs)
-        self.time_start_cb = time_start_cb
 
     def tickStrings(self, values, scale, spacing):
-        start = 0.0
-        if callable(self.time_start_cb):
-            try:
-                start = float(self.time_start_cb())
-            except Exception:
-                start = 0.0
         out = []
         for v in values:
-            t = start + v
+            try:
+                t = float(v)
+            except Exception:
+                out.append(str(v)); continue
             if t >= 3600:
                 h = int(t // 3600)
                 m = int((t % 3600) // 60)
@@ -59,23 +55,31 @@ class TimeAxisItem(pg.AxisItem):
         return out
 
 class BLFReaderThread(QtCore.QThread):
+    """
+    BLF ファイルを逐次読み込み、指定した signal keys に該当するデータをバッチで main thread に渡す。
+    変更点:
+      - resume_time (秒) を受け取り、ts < resume_time のメッセージは読み捨てることで「指定時刻から再開」を実装。
+      - stop() を呼ぶと _running を False にしてループを抜ける（即時停止を試みる）。
+    """
     data_batch_ready = QtCore.Signal(dict, float)
     progress = QtCore.Signal(int)
     finished = QtCore.Signal()
     error = QtCore.Signal(str)
 
-    def __init__(self, blf_path, dbs_info, target_keys, parent=None):
+    def __init__(self, blf_path, dbs_info, target_keys, resume_time=None, parent=None):
         super().__init__(parent)
         self.blf_path = blf_path
         self.dbs_info = dbs_info
         self.target_keys = set(target_keys)
         self._running = True
+        self.resume_time = resume_time  # seconds from start (relative timestamp), None means start from beginning
         self.target_messages = defaultdict(list)
         for db, dbc_name in self.dbs_info:
             for msg in db.messages:
                 self.target_messages[msg.frame_id].append((msg, dbc_name))
 
     def stop(self):
+        # main thread が呼ぶ（Pause のとき等）
         self._running = False
 
     def run(self):
@@ -92,8 +96,23 @@ class BLFReaderThread(QtCore.QThread):
         batch = defaultdict(lambda: {"t": [], "v": []})
 
         for msg in reader:
+            # 停止要求があればすぐ抜ける
             if not self._running:
                 break
+
+            try:
+                raw_ts = float(msg.timestamp)
+            except Exception:
+                # タイムスタンプが取得できないならスキップ
+                continue
+
+            if base_ts is None:
+                base_ts = raw_ts
+            ts = raw_ts - base_ts
+
+            # resume_time が指定されていれば、それより前のデータは読み捨てる（スキップ）
+            if self.resume_time is not None and ts < self.resume_time:
+                continue
 
             arb = msg.arbitration_id
             msgs_to_try = self.target_messages.get(arb)
@@ -101,10 +120,6 @@ class BLFReaderThread(QtCore.QThread):
                 continue
 
             count += 1
-            raw_ts = float(msg.timestamp)
-            if base_ts is None:
-                base_ts = raw_ts
-            ts = raw_ts - base_ts
             if ts > max_ts:
                 max_ts = ts
 
@@ -117,19 +132,22 @@ class BLFReaderThread(QtCore.QThread):
                             batch[key]["t"].append(ts)
                             batch[key]["v"].append(sval)
                 except Exception:
+                    # デコードエラー等は無視して先に進める
                     pass
 
+            # 定期的にバッチを送る（負荷を分散）
             if count % 10000 == 0:
                 self.data_batch_ready.emit(dict(batch), max_ts)
                 batch.clear()
                 self.progress.emit(count)
 
+        # 残りを送る
         if batch:
             self.data_batch_ready.emit(dict(batch), max_ts)
 
         try:
             reader.close()
-        except:
+        except Exception:
             pass
 
         self.finished.emit()
@@ -239,7 +257,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BLF Viewer (fixed)")
+        self.setWindowTitle("BLF Viewer")
         self.resize(1400, 850)
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
@@ -254,6 +272,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.play_pos = 0.0
         self.current_display_start = 0.0
         self.is_workspace_modified = False
+
+        # resume 時刻（秒）を保持。Pause で保存し、Resume で利用する
+        self.resume_ts = None
 
         # initialize active_state for stale hysteresis if needed later
         self.active_state = {}
@@ -280,9 +301,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.x_mode_combo.currentIndexChanged.connect(self.mark_workspace_modified)
         self.x_mode_combo.currentIndexChanged.connect(lambda: self.update_plots_and_table())
         tb.addWidget(QtWidgets.QLabel(" X-Mode: ")); tb.addWidget(self.x_mode_combo)
-        self.window_spin = QtWidgets.QDoubleSpinBox(); self.window_spin.setRange(0.1, 3600.0); self.window_spin.setValue(5.0)
+        self.window_spin = QtWidgets.QDoubleSpinBox(); self.window_spin.setRange(0.1, 3600.0);
+        self.window_spin.setValue(5.0); self.window_spin.setSingleStep(0.5)
         self.window_spin.valueChanged.connect(self.mark_workspace_modified)
-        tb.addWidget(QtWidgets.QLabel(" Win(s): ")); tb.addWidget(self.window_spin)
+        tb.addWidget(QtWidgets.QLabel(" Window(s): ")); tb.addWidget(self.window_spin)
         self.autoy_checkbox = QtWidgets.QCheckBox(" Auto Y-Fit "); self.autoy_checkbox.toggled.connect(self.mark_workspace_modified)
         tb.addWidget(self.autoy_checkbox)
         tb.addSeparator()
@@ -329,8 +351,8 @@ class MainWindow(QtWidgets.QMainWindow):
         header_tbl.setSectionResizeMode(2, QtWidgets.QHeaderView.Interactive)
         header_tbl.setSectionResizeMode(3, QtWidgets.QHeaderView.Interactive)
         header_tbl.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
-        self.active_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.active_table.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.active_table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
         self.active_table.setColumnWidth(1,100); self.active_table.setColumnWidth(2,120); self.active_table.setColumnWidth(3,80)
         self.active_table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         self.active_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -394,6 +416,15 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"Failed to save workspace: {e}")
 
     def closeEvent(self, event):
+        # スレッドを停止してから閉じるようにする
+        try:
+            if hasattr(self, 'reader') and getattr(self, 'reader') is not None and getattr(self, 'reader').isRunning():
+                # ユーザーが閉じる際は reader を停止して少し待つ
+                self.reader.stop()
+                self.reader.wait(1000)
+        except Exception:
+            pass
+
         if not self.dbc_paths and not getattr(self,'blf_path',None) and not self.plots:
             event.accept(); return
         if not self.is_workspace_modified: event.accept(); return
@@ -491,7 +522,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def add_signal_plot(self, key):
         meta = self.meta[key]
         color = pg.intColor(len(self.plots), hues=15)
-        axis = TimeAxisItem(orientation='bottom', time_start_cb=lambda: self.current_display_start)
+        axis = TimeAxisItem(orientation='bottom')
         pw = pg.PlotWidget(axisItems={'bottom': axis}); pw.setFixedHeight(180); pi = pw.getPlotItem()
         pi.showGrid(x=True, y=True, alpha=0.5)
         title = f"[{meta['dbc_name']}] {meta['msg']} . {meta['sig']}"
@@ -500,7 +531,6 @@ class MainWindow(QtWidgets.QMainWindow):
         curve = pi.plot([], [], pen=pg.mkPen(color=color, width=2))
         curve.setClipToView(True)
         curve.setDownsampling(ds=True, auto=True, method='peak')
-        line = pg.InfiniteLine(angle=90, movable=False, pen=pg.mkPen('r', width=1.5, style=QtCore.Qt.DashLine)); pi.addItem(line)
         for other in self.plots.values():
             try:
                 pi.setXLink(other['widget'].getPlotItem())
@@ -508,7 +538,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         self.plot_vbox.insertWidget(self.plot_vbox.count() - 1, pw)
         # store
-        self.plots[key] = {"widget": pw, "curve": curve, "line": line, "meta": meta, "color": color, "axis_applied": False}
+        self.plots[key] = {"widget": pw, "curve": curve, "meta": meta, "color": color, "axis_applied": False}
         # apply DBC meta to axis (NEW)
         self.apply_meta_to_axis(key)
         self.add_to_active_table(key)
@@ -607,28 +637,73 @@ class MainWindow(QtWidgets.QMainWindow):
             del self.plots[key]; self.mark_workspace_modified()
 
     def toggle_play(self):
+        """
+        Play / Pause のトグル。
+        - Play 押下:
+            - self.resume_ts が None => 新規読み込み（data をクリアして先頭から読み始める）
+            - self.resume_ts がある => Pause 解除（data を保持し resume_ts からスキップして再開）
+        - Pause 押下:
+            - self.resume_ts = self.play_pos を保存して reader.stop() を呼ぶ（読み取りを止める）
+        """
         if not hasattr(self, 'blf_path') or not self.dbs_info:
             QtWidgets.QMessageBox.warning(self,"Warning","Please load at least one DBC and a BLF file first."); return
+
         if not self.is_playing:
-            self.data.clear(); self.max_time = 0.0; self.play_pos = 0.0
+            # Play / Resume
             target_keys = list(self.plots.keys())
             if not target_keys:
                 QtWidgets.QMessageBox.information(self,"Info","Please select at least one signal to plot first."); return
-            self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys)
+
+            resume_ts = getattr(self, 'resume_ts', None)
+            if resume_ts is None:
+                # 新規再生: 既存データはクリアして先頭から開始
+                self.data.clear(); self.max_time = 0.0; self.play_pos = 0.0
+                self.status.showMessage("Starting playback from beginning...")
+            else:
+                # 再開: data は保持、play_pos は resume_ts のままにする
+                self.play_pos = resume_ts
+                self.status.showMessage(f"Resuming playback from {resume_ts:.3f} s...")
+
+            # reader に resume_time を渡す（None なら先頭から）
+            self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys, resume_time=resume_ts)
             self.reader.data_batch_ready.connect(self.on_data_batch)
             self.reader.progress.connect(lambda n: self.status.showMessage(f"Reading... {n} target frames parsed"))
-            self.reader.finished.connect(lambda: self.status.showMessage("Reading Finished / Paused"))
+            # スレッド終了時は _on_reader_finished を呼ぶ
+            self.reader.finished.connect(self._on_reader_finished)
+            self.reader.error.connect(lambda s: self.status.showMessage(s))
             self.reader.start()
             self.is_playing = True; self.play_btn.setText("⏸ Pause"); self.play_timer.start()
         else:
+            # Pause 押下: 読み取りを止め、次回再開時にここから再開する
             try:
-                self.reader.stop()
+                # 現在の再生位置を保存
+                self.resume_ts = float(self.play_pos)
+            except Exception:
+                self.resume_ts = getattr(self, 'play_pos', 0.0)
+            try:
+                if hasattr(self, 'reader') and self.reader is not None:
+                    self.reader.stop()
             except Exception:
                 pass
-            self.is_playing = False; self.play_btn.setText("▶ Play / Load Data"); self.play_timer.stop()
+            self.is_playing = False; self.play_btn.setText("▶ Play / Load"); self.play_timer.stop()
+            self.status.showMessage(f"Paused at {self.resume_ts:.3f} s")
+
+    def _on_reader_finished(self):
+        # スレッド終了後のクリーンアップ
+        try:
+            # reader が終了したらオブジェクト解放できるようにする
+            self.reader = None
+        except Exception:
+            pass
+        # 状態に応じてメッセージを出す
+        if getattr(self, 'resume_ts', None) is not None and not self.is_playing:
+            self.status.showMessage("Paused")
+        else:
+            self.status.showMessage("Reading Finished")
 
     @QtCore.Slot(dict, float)
     def on_data_batch(self, batch, new_max_time):
+        # データを受け取って internal buffer に追加。max_time を更新。
         if new_max_time > self.max_time: self.max_time = new_max_time
         for key, new_data in batch.items():
             if key not in self.data: self.data[key] = {"t": [], "v_raw": [], "v_num": []}
@@ -671,10 +746,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if self.max_time > 0 and self.play_pos > self.max_time:
                 self.play_pos = self.max_time
         if self.max_time > 0:
-            spos = int((self.play_pos / self.max_time) * 10000)
+            spos = int((self.play_pos / self.max_time) * 10000) if self.max_time > 0 else 0
             self.slider.blockSignals(True)
             self.slider.setValue(min(10000, spos))
             self.slider.blockSignals(False)
+
     def on_slider_moved(self, val):
         if self.max_time > 0:
             self.play_pos = (val / 10000.0) * self.max_time
@@ -689,16 +765,14 @@ class MainWindow(QtWidgets.QMainWindow):
         stale_threshold = float(self.stale_spin.value())
         auto_y = self.autoy_checkbox.isChecked()
 
-        # --- FIX: Follow (Trailing) calculation corrected ---
+        # --- Follow (Trailing) / Fixed Window / Auto Fit handling ---
         if mode == "Fixed Window":
             start = max(0.0, self.play_pos - win/2)
             end = start + win
         elif mode == "Follow (Trailing)":
-            # right edge should be play_pos; start is play_pos - win
             end = max(0.0, self.play_pos)
             start = max(0.0, end - win)
         else:  # Auto Fit
-            # fit to visible data across plots
             times = []
             for k in self.plots.keys():
                 d = self.data.get(k)
@@ -726,7 +800,7 @@ class MainWindow(QtWidgets.QMainWindow):
             d = self.data.get(key)
             if d and len(d["t"]) > 0:
                 t_list = d["t"]
-                # choose indices within window (no extra +/- win as before)
+                # choose indices within window
                 idx_start = bisect.bisect_left(t_list, start)
                 idx_end = bisect.bisect_right(t_list, end)
                 if idx_end > idx_start:
@@ -736,7 +810,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     if len(t_slice) > 30000:
                         step = max(1, len(t_slice) // 30000)
                         t_slice = t_slice[::step]; v_slice = v_slice[::step]
-                    t_plot = np.array(t_slice) - start
+                    t_plot = np.array(t_slice)
                     v_plot = np.array(v_slice)
                     # Auto Y-scale if enabled or axis not applied
                     if (auto_y or not p_data.get("axis_applied", False)) and len(v_plot) > 0:
@@ -759,11 +833,8 @@ class MainWindow(QtWidgets.QMainWindow):
                         p_data["curve"].setData(t_step, v_step)
                 else:
                     p_data["curve"].setData([], [])
-                # cursor & x-range
-                cursor_pos = self.play_pos - start
                 try:
-                    p_data["line"].setPos(cursor_pos)
-                    p_data["widget"].getPlotItem().setXRange(0, window_span, padding=0)
+                    p_data["widget"].getPlotItem().setXRange(start, end, padding=0)
                 except Exception:
                     pass
                 # current value display with stale check
