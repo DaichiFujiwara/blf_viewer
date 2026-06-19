@@ -1,5 +1,5 @@
 # blf_viewer.py
-# Updated: Accurate UI Interval timing (1s updates), correct Follow ON snapping, and free panning when Follow OFF.
+# Updated: Cleaned up for static data analysis. Allows free sliding/zooming of loaded parts during BLF loading.
 # Requirements: PySide6, pyqtgraph, python-can, cantools, numpy
 
 import sys
@@ -17,7 +17,7 @@ import cantools
 import can
 
 CONFIG_FILE = "blf_viewer_workspace.json"
-MAX_TIMELINE = 200_000  # メモリ保護のための最大保持サンプル数
+MAX_TIMELINE = 500_000  # 解析用に保持サンプル数を拡張
 
 def _try_get_attr(obj, names, default=None):
     for n in names:
@@ -66,13 +66,12 @@ class BLFReaderThread(QtCore.QThread):
     finished = QtCore.Signal()
     error = QtCore.Signal(str)
 
-    def __init__(self, blf_path, dbs_info, target_keys, resume_time=None, parent=None):
+    def __init__(self, blf_path, dbs_info, target_keys, parent=None):
         super().__init__(parent)
         self.blf_path = blf_path
         self.dbs_info = dbs_info
         self.target_keys = set(target_keys)
         self._running = True
-        self.resume_time = resume_time
         
         self.target_messages = defaultdict(list)
         for db, dbc_name in self.dbs_info:
@@ -107,9 +106,6 @@ class BLFReaderThread(QtCore.QThread):
                 base_ts = raw_ts
             ts = raw_ts - base_ts
             
-            if self.resume_time is not None and ts < self.resume_time:
-                continue
-                
             arb = msg.arbitration_id
             msgs_to_try = self.target_messages.get(arb)
             if not msgs_to_try:
@@ -130,7 +126,7 @@ class BLFReaderThread(QtCore.QThread):
                 except Exception:
                     pass
                     
-            if count % 10000 == 0:
+            if count % 20000 == 0:
                 self.data_batch_ready.emit(dict(batch), max_ts)
                 batch.clear()
                 self.progress.emit(count)
@@ -236,7 +232,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pro BLF Signal Viewer (Interval Update & Free Pan Edition)")
+        self.setWindowTitle("Pro BLF Signal Viewer (Analysis Edition)")
         self.resize(1400, 850)
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
@@ -249,14 +245,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.plots = {}
         self.max_time = 0.0
         self.play_pos = 0.0
-        self.current_display_start = 0.0
+        self.current_window_span = 5.0  
         self.is_workspace_modified = False
-        self.resume_ts = None
+        self.reader = None
 
-        self.follow_enabled = True       
         self.user_interacting = False    
         self._mouse_interacting = False  
-        self.last_interaction_time = 0.0
 
         self.transition_active = False
         self.transition_steps = 8
@@ -274,15 +268,15 @@ class MainWindow(QtWidgets.QMainWindow):
         save_shortcut.activated.connect(self.manual_save)
 
     def setup_ui(self):
-        tb = self.addToolBar("Main")
+        tb = self.main_toolbar = self.addToolBar("Main")
         tb.setMovable(False)
-        act_blf = QtGui.QAction("📂 Open BLF", self); act_blf.triggered.connect(self.open_blf)
-        tb.addAction(act_blf)
-        act_dbc = QtGui.QAction("➕ Add DBC(s)", self); act_dbc.triggered.connect(self.add_dbc_dialog)
-        tb.addAction(act_dbc)
+        self.act_blf = QtGui.QAction("📂 Open BLF", self); self.act_blf.triggered.connect(self.open_blf)
+        tb.addAction(self.act_blf)
+        self.act_dbc = QtGui.QAction("➕ Add DBC(s)", self); self.act_dbc.triggered.connect(self.add_dbc_dialog)
+        tb.addAction(self.act_dbc)
         tb.addSeparator()
-        act_search = QtGui.QAction("🔍 Search", self); act_search.triggered.connect(self.open_global_search)
-        tb.addAction(act_search)
+        self.act_search = QtGui.QAction("🔍 Search", self); self.act_search.triggered.connect(self.open_global_search)
+        tb.addAction(self.act_search)
         tb.addSeparator()
 
         self.x_mode_combo = QtWidgets.QComboBox()
@@ -292,7 +286,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.window_spin = QtWidgets.QDoubleSpinBox(); self.window_spin.setRange(0.1, 3600.0)
         self.window_spin.setValue(5.0); self.window_spin.setSingleStep(0.5)
-        self.window_spin.valueChanged.connect(self.mark_workspace_modified)
+        self.window_spin.setKeyboardTracking(False)  
+        self.window_spin.valueChanged.connect(self.on_window_spin_changed)
         tb.addWidget(QtWidgets.QLabel(" Window(s): ")); tb.addWidget(self.window_spin)
 
         self.autoy_checkbox = QtWidgets.QCheckBox(" Auto Y-Fit ")
@@ -300,35 +295,18 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addWidget(self.autoy_checkbox)
         tb.addSeparator()
 
-        self.stale_spin = QtWidgets.QDoubleSpinBox(); self.stale_spin.setRange(0.1, 3600.0)
-        self.stale_spin.setSingleStep(0.5); self.stale_spin.setValue(2.0)
-        self.stale_spin.valueChanged.connect(self.mark_workspace_modified)
-        tb.addWidget(QtWidgets.QLabel(" Stale(s): ")); tb.addWidget(self.stale_spin)
+        self.load_btn = QtWidgets.QPushButton("📥 Load / Reload Data"); self.load_btn.clicked.connect(self.trigger_data_load)
+        tb.addWidget(self.load_btn)
         tb.addSeparator()
-
-        self.play_btn = QtWidgets.QPushButton("▶ Play / Load"); self.play_btn.clicked.connect(self.toggle_play)
-        tb.addWidget(self.play_btn)
-
-        self.follow_toggle = QtWidgets.QPushButton()
-        self.follow_toggle.setCheckable(True)
-        self.follow_toggle.setChecked(self.follow_enabled)
-        self.follow_toggle.setToolTip("Toggle automatic following of the playback position.")
-        self.follow_toggle.clicked.connect(self._on_follow_toggled)
-        self._update_follow_button_visual()
-        tb.addWidget(self.follow_toggle)
 
         self.ui_interval_spin = QtWidgets.QDoubleSpinBox(); self.ui_interval_spin.setRange(0.01, 10.0)
         self.ui_interval_spin.setValue(1.0); self.ui_interval_spin.setSingleStep(0.1); self.ui_interval_spin.setSuffix(" s")
         self.ui_interval_spin.setToolTip("UI update interval in seconds")
         self.ui_interval_spin.valueChanged.connect(self._on_ui_interval_changed)
         tb.addWidget(QtWidgets.QLabel(" UI Interval: ")); tb.addWidget(self.ui_interval_spin)
-
-        self.speed_spin = QtWidgets.QDoubleSpinBox(); self.speed_spin.setRange(0.1, 50.0); self.speed_spin.setValue(1.0); self.speed_spin.setSuffix("x")
-        self.speed_spin.valueChanged.connect(self.mark_workspace_modified)
-        tb.addWidget(QtWidgets.QLabel(" Speed: ")); tb.addWidget(self.speed_spin)
         tb.addSeparator()
 
-        act_export = QtGui.QAction("💾 Export CSV", self); act_export.triggered.connect(self.export_csv); tb.addAction(act_export)
+        self.act_export = QtGui.QAction("💾 Export CSV", self); self.act_export.triggered.connect(self.export_csv); tb.addAction(self.act_export)
 
         central = QtWidgets.QWidget(); self.setCentralWidget(central)
         main_layout = QtWidgets.QVBoxLayout(central); main_layout.setContentsMargins(4,4,4,4)
@@ -386,18 +364,22 @@ class MainWindow(QtWidgets.QMainWindow):
         h_splitter.setSizes([450,950]); main_layout.addWidget(h_splitter)
         self.status = self.statusBar()
 
-    def _update_follow_button_visual(self):
-        try:
-            if self.follow_enabled:
-                self.follow_toggle.setText("🔁 Follow: ON")
-                self.follow_toggle.setStyleSheet("background-color: #d0ffd0;")
-                self.follow_toggle.setChecked(True)
-            else:
-                self.follow_toggle.setText("🔁 Follow: OFF")
-                self.follow_toggle.setStyleSheet("")
-                self.follow_toggle.setChecked(False)
-        except Exception:
-            pass
+    def set_ui_enabled(self, enabled):
+        """ロード中はバックグラウンド処理に干渉するボタンのみ無効化し、スライダーやズーム操作は生かす"""
+        self.act_blf.setEnabled(enabled)
+        self.act_dbc.setEnabled(enabled)
+        self.act_search.setEnabled(enabled)
+        self.act_export.setEnabled(enabled)
+        self.load_btn.setEnabled(enabled)
+        
+        # 以下の解析系コントロール、ツリー、スライダー等はロード中も常に利用可能
+        self.x_mode_combo.setEnabled(True)
+        self.window_spin.setEnabled(True)
+        self.autoy_checkbox.setEnabled(True)
+        self.ui_interval_spin.setEnabled(True)
+        self.frame_tree.setEnabled(True)
+        self.active_table.setEnabled(True)
+        self.slider.setEnabled(True)
 
     def mark_workspace_modified(self, *args):
         self.is_workspace_modified = True
@@ -406,8 +388,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.save_config()
         self.status.showMessage("Workspace saved successfully.", 3000)
 
+    def on_window_spin_changed(self, val):
+        self.current_window_span = val
+        self.mark_workspace_modified()
+        self.update_plots_and_table()
+
     def load_config(self):
-        default_config = {"x_mode":"Fixed Window","window_span":5.0,"auto_y":False,"stale_time":2.0,"speed":1.0,"ui_interval":1.0,"dbc_paths":[],"blf_path":None,"selected_signals":[]}
+        default_config = {"x_mode":"Fixed Window","window_span":5.0,"auto_y":False,"ui_interval":1.0,"dbc_paths":[],"blf_path":None,"selected_signals":[]}
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE,"r",encoding="utf-8") as f:
@@ -417,8 +404,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 
         idx = self.x_mode_combo.findText(default_config["x_mode"])
         if idx >= 0: self.x_mode_combo.setCurrentIndex(idx)
-        self.window_spin.setValue(default_config["window_span"]); self.autoy_checkbox.setChecked(default_config["auto_y"])
-        self.stale_spin.setValue(default_config["stale_time"]); self.speed_spin.setValue(default_config["speed"])
+        self.window_spin.setValue(default_config["window_span"])
+        self.current_window_span = default_config["window_span"]
+        self.autoy_checkbox.setChecked(default_config["auto_y"])
         self.ui_interval_spin.setValue(default_config.get("ui_interval", 1.0))
         
         valid_dbcs = [p for p in default_config["dbc_paths"] if os.path.exists(p)]
@@ -436,10 +424,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def save_config(self):
         config = {
             "x_mode":self.x_mode_combo.currentText(),
-            "window_span":self.window_spin.value(),
+            "window_span":self.current_window_span,
             "auto_y":self.autoy_checkbox.isChecked(),
-            "stale_time":self.stale_spin.value(),
-            "speed":self.speed_spin.value(),
             "ui_interval":self.ui_interval_spin.value(),
             "dbc_paths":self.dbc_paths,
             "blf_path":getattr(self,'blf_path',None),
@@ -453,7 +439,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         try:
-            if hasattr(self, 'reader') and getattr(self, 'reader') is not None and getattr(self, 'reader').isRunning():
+            if hasattr(self, 'reader') and self.reader is not None and self.reader.isRunning():
                 self.reader.stop()
                 self.reader.wait(1000)
         except Exception:
@@ -479,10 +465,8 @@ class MainWindow(QtWidgets.QMainWindow):
             event.ignore()
 
     def setup_timers(self):
-        self.is_playing = False
         self.ui_timer = QtCore.QTimer()
-        self.ui_timer.timeout.connect(self.on_ui_timer)
-        # UI Interval に基づいてタイマーを回す（要件通り 1.0s 更新）
+        self.ui_timer.timeout.connect(self.update_plots_and_table)
         ms = int(float(self.ui_interval_spin.value()) * 1000)
         self.ui_timer.setInterval(max(10, ms)) 
         self.ui_timer.start()
@@ -492,36 +476,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui_timer.setInterval(max(10, ms))
         self.status.showMessage(f"UI interval set to {val:.2f} s", 1500)
         self.mark_workspace_modified()
-
-    def on_ui_timer(self):
-        # ユーザーインタラクションの自動解除 (1.5s無操作)
-        if self.user_interacting and time.time() - self.last_interaction_time > 1.5:
-            self.user_interacting = False
-            self._mouse_interacting = False
-            self.status.showMessage("Interaction timeout, auto logic restored", 1500)
-
-        # プレイ時の時刻進行 (UI Interval × speed)
-        if self.is_playing:
-            dt_data = float(self.ui_interval_spin.value()) * float(self.speed_spin.value())
-            
-            if self.follow_enabled and not self.user_interacting:
-                if hasattr(self, 'reader') and getattr(self.reader, 'isRunning', lambda: False)():
-                    if self.max_time > 0:
-                        self.play_pos = self.max_time
-            else:
-                self.play_pos += dt_data
-                if self.max_time > 0 and self.play_pos > self.max_time:
-                    self.play_pos = self.max_time
-                    
-            self._compute_and_set_slider_from_play_pos()
-            
-        elif self.follow_enabled and not self.user_interacting:
-            # 再生がPausedでもFollow ONなら最新時刻に追従する
-            if self.max_time > 0 and self.play_pos != self.max_time:
-                self.play_pos = self.max_time
-                self._compute_and_set_slider_from_play_pos()
-
-        self.update_plots_and_table()
 
     def _load_dbc_files(self, paths):
         loaded_any = False
@@ -559,7 +513,110 @@ class MainWindow(QtWidgets.QMainWindow):
     def open_blf(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self,"Open BLF","","BLF Files (*.blf)")
         if path:
-            self.blf_path = path; self.status.showMessage(f"Selected BLF: {path}"); self.mark_workspace_modified()
+            if hasattr(self, 'reader') and self.reader is not None and self.reader.isRunning():
+                self.reader.stop()
+                self.reader.wait(1000)
+                
+            self.blf_path = path
+            self.status.showMessage(f"Selected BLF: {path}")
+            
+            self.data.clear()
+            self.max_time = 0.0
+            self.play_pos = 0.0
+            self.user_interacting = False
+            self._mouse_interacting = False
+            
+            for p_data in self.plots.values():
+                try:
+                    p_data["curve"].setData([], [])
+                except Exception:
+                    pass
+            
+            self._compute_and_set_slider_from_play_pos()
+            self.time_label.setText("Time: 0.000 s")
+            
+            for row in range(self.active_table.rowCount()):
+                val_item = self.active_table.item(row, 3)
+                if val_item:
+                    val_item.setText("-")
+            
+            self.trigger_data_load()
+
+    def trigger_data_load(self):
+        if not getattr(self, 'blf_path', None) or not self.dbs_info:
+            QtWidgets.QMessageBox.warning(self, "Warning", "Please load at least one DBC and a BLF file first.")
+            return
+
+        target_keys = list(self.plots.keys())
+        if not target_keys:
+            QtWidgets.QMessageBox.information(self, "Info", "Please select at least one signal to plot first.")
+            return
+
+        if hasattr(self, 'reader') and self.reader is not None and self.reader.isRunning():
+            self.reader.stop()
+            self.reader.wait(1000)
+
+        # ロード中にバックグラウンド処理を阻害するアクションのみを無効化（限定グレーアウト）
+        self.set_ui_enabled(False)
+
+        self.data.clear()
+        self.max_time = 0.0
+        self.status.showMessage("Loading all data from BLF...")
+        
+        self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys)
+        self.reader.data_batch_ready.connect(self.on_data_batch)
+        self.reader.progress.connect(lambda n: self.status.showMessage(f"Reading... {n} target frames parsed"))
+        self.reader.finished.connect(self._on_reader_finished)
+        self.reader.error.connect(self._on_reader_error)
+        self.reader.start()
+
+    def _on_reader_finished(self):
+        try: self.reader = None
+        except Exception: pass
+        self.status.showMessage(f"Loading Finished. Total Time: {self.max_time:.3f} s")
+        self.update_plots_and_table()
+        self.set_ui_enabled(True)
+
+    def _on_reader_error(self, s):
+        self.status.showMessage(s)
+        self.set_ui_enabled(True)
+
+    def on_data_batch(self, batch, new_max_time):
+        if new_max_time > self.max_time: 
+            self.max_time = new_max_time
+            
+        for key, new_data in batch.items():
+            if key not in self.data: self.data[key] = {"t": [], "v_raw": [], "v_num": []}
+            
+            self.data[key]["t"].extend(new_data["t"])
+            self.data[key]["v_raw"].extend(new_data["v"])
+            
+            choices = self.meta.get(key, {}).get("choices")
+            nums = []
+            for val in new_data["v"]:
+                if isinstance(val, (int, float)):
+                    nums.append(float(val))
+                elif choices:
+                    mapped = 0.0
+                    for k_c, lbl in choices.items():
+                        if str(lbl) == str(val) or k_c == val:
+                            try: mapped = float(k_c)
+                            except: pass
+                            break
+                    nums.append(mapped)
+                else:
+                    try: nums.append(float(val))
+                    except: nums.append(0.0)
+            self.data[key]["v_num"].extend(nums)
+            
+            if len(self.data[key]["t"]) > MAX_TIMELINE:
+                self.data[key]["t"] = self.data[key]["t"][-MAX_TIMELINE:]
+                self.data[key]["v_raw"] = self.data[key]["v_raw"][-MAX_TIMELINE:]
+                self.data[key]["v_num"] = self.data[key]["v_num"][-MAX_TIMELINE:]
+
+            if key in self.plots:
+                if not self.plots[key].get("axis_applied", False):
+                    self.apply_meta_to_axis(key)
 
     def open_signal_popup(self, item, column):
         frame_id = item.data(0, QtCore.Qt.UserRole); dbc_name = item.data(1, QtCore.Qt.UserRole); msg_name = item.text(2)
@@ -617,7 +674,6 @@ class MainWindow(QtWidgets.QMainWindow):
         curve = pi.plot([], [], pen=pg.mkPen(color=color, width=2))
         curve.setClipToView(True)
         
-        # マウスのパン操作検知
         try:
             vb = pw.getViewBox()
             vb.sigRangeChanged.connect(self._on_user_interaction)
@@ -717,37 +773,10 @@ class MainWindow(QtWidgets.QMainWindow):
             del self.plots[key]; self.mark_workspace_modified()
 
     def _on_user_interaction(self, *args):
-        # Follow/自動更新によるX軸変更は無視する
         if getattr(self, '_auto_ranging', False):
             return
-        
         self.user_interacting = True
         self._mouse_interacting = True
-        self.last_interaction_time = time.time()
-        
-        # ユーザーがマウスでグラフを動かしたらFollowを自動解除
-        if self.follow_enabled:
-            self.follow_enabled = False
-            self._update_follow_button_visual()
-            self.status.showMessage("Follow disabled (user interaction)", 1500)
-
-    def _on_follow_toggled(self, checked=None):
-        try: checked_state = bool(self.follow_toggle.isChecked())
-        except Exception: checked_state = bool(checked)
-        self.follow_enabled = checked_state
-        self._update_follow_button_visual()
-        
-        # FollowをONにした瞬間、最新データへジャンプする
-        if self.follow_enabled:
-            self.user_interacting = False
-            self._mouse_interacting = False
-            if self.max_time > 0:
-                self.play_pos = self.max_time
-            self._compute_and_set_slider_from_play_pos()
-            self.transition_active = False
-            self.update_plots_and_table()
-            
-        self.status.showMessage(f"Follow {'enabled' if self.follow_enabled else 'disabled'}", 1500)
 
     def on_slider_moved(self, val):
         if self.max_time <= 0: return
@@ -755,21 +784,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.transition_active = False
         
         self.user_interacting = True
-        self._mouse_interacting = False  # スライダー移動はグラフパンではないためFalse
-        self.last_interaction_time = time.time()
-        
-        # スライダーを動かしたらFollowを解除
-        if self.follow_enabled:
-            self.follow_enabled = False
-            self._update_follow_button_visual()
-            self.status.showMessage("Follow disabled (slider moved)", 1500)
-            
+        self._mouse_interacting = False
         self.update_plots_and_table()
 
     def on_mode_changed(self, *args):
         new_mode = self.x_mode_combo.currentText()
         curr_start, curr_end = self._get_current_display_range_estimate()
-        win = float(self.window_spin.value())
+        win = self.current_window_span
         
         if new_mode == "Fixed Window":
             t_start = max(0.0, self.play_pos - win / 2.0)
@@ -786,16 +807,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 t_start = max(0.0, min(times) - 0.5); t_end = max(times) + 0.5
                 if t_end - t_start < 1e-6: t_end = t_start + max(0.5, win)
         
-        if not self.is_playing:
-            self.prev_start = curr_start; self.prev_end = curr_end
-            self.target_start = t_start; self.target_end = t_end
-            self.transition_active = True
-            self.transition_step = 0
+        self.prev_start = curr_start; self.prev_end = curr_end
+        self.target_start = t_start; self.target_end = t_end
+        self.transition_active = True
+        self.transition_step = 0
             
         self.update_plots_and_table()
 
     def _get_current_display_range_estimate(self, p_data=None):
-        # マウスでグラフをパン/ズーム中の場合、ViewBoxの実際の範囲を返す
         if self.user_interacting and getattr(self, '_mouse_interacting', False):
             if p_data is not None:
                 try:
@@ -813,9 +832,9 @@ class MainWindow(QtWidgets.QMainWindow):
                     except Exception:
                         pass
         
-        win = float(self.window_spin.value())
+        win = self.current_window_span
         mode = self.x_mode_combo.currentText()
-        if self.transition_active and not self.is_playing:
+        if self.transition_active:
             frac = (self.transition_step + 1) / float(max(1, self.transition_steps))
             start = self.prev_start + (self.target_start - self.prev_start) * frac
             end = self.prev_end + (self.target_end - self.prev_end) * frac
@@ -837,113 +856,38 @@ class MainWindow(QtWidgets.QMainWindow):
                     if end - start < 1e-6: end = start + max(0.5, win)
             return start, end
 
-    def toggle_play(self):
-        if not hasattr(self, 'blf_path') or not self.dbs_info:
-            QtWidgets.QMessageBox.warning(self, "Warning", "Please load at least one DBC and a BLF file first.")
-            return
-
-        if not self.is_playing:
-            target_keys = list(self.plots.keys())
-            if not target_keys:
-                QtWidgets.QMessageBox.information(self, "Info", "Please select at least one signal to plot first.")
-                return
-
-            self.resume_ts = getattr(self, 'play_pos', 0.0)
-            if self.resume_ts <= 0.0:
-                self.data.clear(); self.max_time = 0.0; self.play_pos = 0.0; self.resume_ts = 0.0
-                self.status.showMessage("Starting playback from beginning...")
-            else:
-                self.status.showMessage(f"Resuming playback from {self.resume_ts:.3f} s...")
-                
-            self.reader = BLFReaderThread(self.blf_path, self.dbs_info, target_keys, resume_time=self.resume_ts)
-            self.reader.data_batch_ready.connect(self.on_data_batch)
-            self.reader.progress.connect(lambda n: self.status.showMessage(f"Reading... {n} target frames parsed"))
-            self.reader.finished.connect(self._on_reader_finished)
-            self.reader.error.connect(lambda s: self.status.showMessage(s))
-            self.reader.start()
-            
-            self.is_playing = True; self.play_btn.setText("⏸ Pause")
-        else:
-            try:
-                if hasattr(self, 'reader') and self.reader is not None:
-                    self.reader.stop()
-                    self.reader.wait(500)
-            except Exception:
-                pass
-            self.is_playing = False; self.play_btn.setText("▶ Play / Load")
-            self.status.showMessage(f"Paused at {self.play_pos:.3f} s")
-
-    def _on_reader_finished(self):
-        try: self.reader = None
-        except Exception: pass
-        if not self.is_playing:
-            self.status.showMessage("Paused")
-        else:
-            self.status.showMessage("Reading Finished")
-
-    @QtCore.Slot(dict, float)
-    def on_data_batch(self, batch, new_max_time):
-        if new_max_time > self.max_time: self.max_time = new_max_time
-        for key, new_data in batch.items():
-            if key not in self.data: self.data[key] = {"t": [], "v_raw": [], "v_num": []}
-            
-            self.data[key]["t"].extend(new_data["t"])
-            self.data[key]["v_raw"].extend(new_data["v"])
-            
-            choices = self.meta.get(key, {}).get("choices")
-            nums = []
-            for val in new_data["v"]:
-                if isinstance(val, (int, float)):
-                    nums.append(float(val))
-                elif choices:
-                    mapped = 0.0
-                    for k_c, lbl in choices.items():
-                        if str(lbl) == str(val) or k_c == val:
-                            try: mapped = float(k_c)
-                            except: pass
-                            break
-                    nums.append(mapped)
-                else:
-                    try: nums.append(float(val))
-                    except: nums.append(0.0)
-            self.data[key]["v_num"].extend(nums)
-            
-            if len(self.data[key]["t"]) > MAX_TIMELINE:
-                self.data[key]["t"] = self.data[key]["t"][-MAX_TIMELINE:]
-                self.data[key]["v_raw"] = self.data[key]["v_raw"][-MAX_TIMELINE:]
-                self.data[key]["v_num"] = self.data[key]["v_num"][-MAX_TIMELINE:]
-
-            if key in self.plots:
-                if not self.plots[key].get("axis_applied", False):
-                    self.apply_meta_to_axis(key)
-
     def _compute_and_set_slider_from_play_pos(self):
         if self.max_time > 0:
-            spos = int((self.play_pos / self.max_time) * 10000) if self.max_time > 0 else 0
+            spos = int((self.play_pos / self.max_time) * 10000)
             self.slider.blockSignals(True)
             self.slider.setValue(min(10000, spos))
+            self.slider.blockSignals(False)
+        else:
+            self.slider.blockSignals(True)
+            self.slider.setValue(0)
             self.slider.blockSignals(False)
 
     def update_plots_and_table(self):
         if not self.plots:
             return
             
+        # ロード中にmax_timeが増加しても、play_posが未ロード部分（未来）に飛び出さないよう制限
+        if self.play_pos > self.max_time:
+            self.play_pos = self.max_time
+            
+        # ロードによるmax_timeの増加に伴い、現在のplay_pos（閲覧位置）に合わせてつまみ位置を逆算・更新
+        self._compute_and_set_slider_from_play_pos()
+            
         self.time_label.setText(f"Time: {self.play_pos:.3f} s")
-        
-        stale_threshold = float(self.stale_spin.value())
         auto_y = self.autoy_checkbox.isChecked()
         
-        if self.transition_active and not self.is_playing:
+        if self.transition_active:
             self.transition_step += 1
             if self.transition_step >= self.transition_steps:
                 self.transition_active = False
 
         base_start, base_end = self._get_current_display_range_estimate(p_data=None)
         if base_end <= base_start: base_end = base_start + 1.0
-        
-        # ユーザーによるUI Intervalをグリッド幅として利用
-        grid_step = float(self.ui_interval_spin.value())
-        if grid_step < 0.001: grid_step = 0.001
         
         self._auto_ranging = True
         try:
@@ -956,7 +900,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 p_data = self.plots[key]
                 d = self.data.get(key)
                 
-                # ユーザーがマウス操作中なら、そのグラフの範囲を尊重する
                 start, end = base_start, base_end
                 if self.user_interacting and getattr(self, '_mouse_interacting', False):
                     start, end = self._get_current_display_range_estimate(p_data=p_data)
@@ -973,25 +916,16 @@ class MainWindow(QtWidgets.QMainWindow):
                     idx_end = bisect.bisect_right(t_list, end + span * 0.1)
                     
                     if idx_end > idx_start:
-                        # 点数をウィンドウ幅に応じて可変調整
-                        N_plot = min(1000, max(50, int(span * 50)))
-                        t_grid = np.linspace(start, end, N_plot)
-                        choices = p_data["meta"].get("choices")
+                        t_render = t_list[idx_start:idx_end]
+                        v_render = v_num_list[idx_start:idx_end]
                         
+                        choices = p_data["meta"].get("choices")
                         if choices:
-                            idx_arr = np.searchsorted(t_list, t_grid) - 1
-                            idx_arr = np.clip(idx_arr, 0, len(t_list) - 1)
-                            v_plot = v_num_list[idx_arr]
-                            t_render = np.repeat(t_grid, 2)[1:]
-                            v_render = np.repeat(v_plot, 2)[:-1]
-                        else:
-                            v_plot = np.interp(t_grid, t_list, v_num_list)
-                            t_render = t_grid
-                            v_render = v_plot
+                            t_render = np.repeat(t_render, 2)[1:]
+                            v_render = np.repeat(v_render, 2)[:-1]
 
-                        # Auto Y-Fit
-                        if (auto_y or not p_data.get("axis_applied", False)) and len(v_num_list) > 0:
-                            vmin, vmax = np.min(v_num_list), np.max(v_num_list)
+                        if (auto_y or not p_data.get("axis_applied", False)):
+                            vmin, vmax = np.min(v_render), np.max(v_render)
                             if vmax > vmin:
                                 pad = (vmax - vmin) * 0.1
                                 try: p_data["widget"].getPlotItem().setYRange(vmin - pad, vmax + pad, padding=0)
@@ -1005,8 +939,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     else:
                         p_data["curve"].setData([], [])
                         
-                    # マウスで直接パン操作中ではない場合のみ、プログラムからX軸の描画範囲を強制適用する
-                    # これにより、スライダー操作やFollow中でのみ画面が同期して動く
                     if not getattr(self, '_mouse_interacting', False):
                         try: 
                             vb = p_data["widget"].getPlotItem().getViewBox()
@@ -1015,15 +947,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             vb.blockSignals(False)
                         except Exception: pass
                         
-                    # Active table 値の更新
                     idx_cur = bisect.bisect_right(t_list, self.play_pos) - 1
                     val_str = "-"
-                    is_stale = False
                     
                     if len(t_list) > 0 and idx_cur >= 0:
                         choices = p_data["meta"].get("choices")
-                        age = self.play_pos - t_list[idx_cur]
-                        is_stale = (age > stale_threshold)
                         
                         if choices:
                             raw_val = v_raw_list[idx_cur]
@@ -1041,14 +969,14 @@ class MainWindow(QtWidgets.QMainWindow):
                         unit = p_data['meta'].get('unit', "")
                         if unit: val_str += f" [{unit}]"
                         
-                        if is_stale:
-                            val_str += " (stale)"
-                            p_data["curve"].setPen(pg.mkPen(color=(160,160,160), width=1.5, style=QtCore.Qt.DashLine))
-                        else:
-                            p_data["curve"].setPen(pg.mkPen(color=p_data["color"], width=2))
+                        p_data["curve"].setPen(pg.mkPen(color=p_data["color"], width=2))
                             
                         val_item = self.active_table.item(row, 3)
                         if val_item: val_item.setText(val_str)
+                else:
+                    p_data["curve"].setData([], [])
+                    val_item = self.active_table.item(row, 3)
+                    if val_item: val_item.setText("-")
         finally:
             self._auto_ranging = False
 
