@@ -232,7 +232,7 @@ class GlobalSearchDialog(QtWidgets.QDialog):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pro BLF Signal Viewer (Analysis Edition)")
+        self.setWindowTitle("BLF Viewer")
         self.resize(1400, 850)
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
